@@ -8,6 +8,7 @@ import subprocess
 import threading
 import logging
 import re
+from functools import partial
 from datetime import datetime
 from urllib.parse import quote as url_quote
 
@@ -29,6 +30,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
         QPushButton, QLineEdit, QLabel, QFileDialog, QListWidget, QListWidgetItem,
         QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QScrollArea,
+        QTreeWidget, QTreeWidgetItem, QProgressBar,
         QFormLayout, QGroupBox, QComboBox, QSpinBox, QDoubleSpinBox, QMessageBox,
         QSplitter, QCheckBox, QDialog, QDialogButtonBox, QInputDialog, QStackedWidget
     )
@@ -492,6 +494,55 @@ class AudioAndTranscriptionMasterWorker(BaseWorker):
             logging.error(f"AudioAndTranscriptionMasterWorker failed: {e}", exc_info=True)
         finally:
             self.signals.finished.emit(success, None)
+            
+class ImageGenerationWorker(BaseWorker):
+    """Генерує всі картинки для всіх сценаріїв."""
+    def __init__(self, parent_worker):
+        super().__init__(settings=parent_worker.settings)
+        self.parent = parent_worker
+
+    @Slot()
+    def run(self):
+        logging.info("--- Sub-step: Image Generation (running in parallel) ---")
+        try:
+            for task_row, lang_idx, lang_config, settings, path in self.parent.scenario_paths:
+                self.check_killed()
+                scenario_name = os.path.basename(path)
+                self.parent.status_update.emit(task_row, lang_idx, f"Images for {scenario_name}")
+                
+                with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
+                    prompts = [line.strip() for line in f if line.strip()]
+                
+                image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
+                service = self.settings['tasks'][self.parent.task_row]['image_service']
+                
+                if service == 'Recraft':
+                    cfg = self.settings['api']['recraft']
+                    client = RecraftClient(cfg['api_key'])
+                    urls, errors = client.generate_images(prompts, style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
+                    if errors: logging.error("\n".join(errors))
+                    for i, url in enumerate(urls):
+                        self.check_killed()
+                        img_data = requests.get(url).content
+                        with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
+                elif service == 'Pollinations':
+                    cfg = self.settings['api']['pollinations']
+                    client = PollinationsClient(api_key=cfg.get('token'))
+                    for i, prompt in enumerate(prompts):
+                        self.check_killed()
+                        self.parent.status_update.emit(task_row, lang_idx, f"Image {i+1}/{len(prompts)} for {scenario_name}")
+                        img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
+                        if error: logging.error(error)
+                        else:
+                            with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
+                        time.sleep(1)
+            self.signals.finished.emit(True, "images")
+        except InterruptedError:
+            logging.warning("ImageGenerationWorker was cancelled.")
+            self.signals.finished.emit(False, "images")
+        except Exception as e:
+            logging.error(f"Image generation failed: {e}", exc_info=True)
+            self.signals.finished.emit(False, "images")
 
 class MainTaskWorker(QObject):
     """Керує повним життєвим циклом одного великого завдання (від сценарію до фінального відео)."""
@@ -587,8 +638,7 @@ class MainTaskWorker(QObject):
         self.asset_phase_tasks_remaining = 2
         self.asset_phase_has_errors = False
         
-        image_worker = BaseWorker(settings=self.settings)
-        image_worker.run = self.generate_all_images
+        image_worker = ImageGenerationWorker(self)
         image_worker.signals.finished.connect(self.on_asset_phase_finished)
         self.threadpool.start(image_worker)
         
@@ -611,46 +661,6 @@ class MainTaskWorker(QObject):
                 else:
                     logging.info("--- Step Finished: All Assets (Images, Audio, Subtitles) are Ready ---")
                     QTimer.singleShot(0, self.run_video_assembly_pipeline)
-
-    def generate_all_images(self):
-        """Генерує всі картинки для всіх сценаріїв."""
-        logging.info("--- Sub-step: Image Generation (running in parallel) ---")
-        try:
-            for task_row, lang_idx, lang_config, settings, path in self.scenario_paths:
-                self.check_killed()
-                scenario_name = os.path.basename(path)
-                self.status_update.emit(task_row, lang_idx, f"Images for {scenario_name}")
-                
-                with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
-                    prompts = [line.strip() for line in f if line.strip()]
-                
-                image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
-                service = self.settings['tasks'][self.task_row]['image_service']
-                
-                if service == 'Recraft':
-                    cfg = self.settings['api']['recraft']
-                    client = RecraftClient(cfg['api_key'])
-                    urls, errors = client.generate_images(prompts, style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
-                    if errors: logging.error("\n".join(errors))
-                    for i, url in enumerate(urls):
-                        self.check_killed()
-                        img_data = requests.get(url).content
-                        with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
-                elif service == 'Pollinations':
-                    cfg = self.settings['api']['pollinations']
-                    client = PollinationsClient(api_key=cfg.get('token'))
-                    for i, prompt in enumerate(prompts):
-                        self.check_killed()
-                        self.status_update.emit(task_row, lang_idx, f"Image {i+1}/{len(prompts)} for {scenario_name}")
-                        img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
-                        if error: logging.error(error)
-                        else:
-                            with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
-                        time.sleep(1)
-            self.signals.finished.emit(True, "images")
-        except Exception as e:
-            logging.error(f"Image generation failed: {e}", exc_info=True)
-            self.signals.finished.emit(False, "images")
 
     def generate_all_audio(self):
         """Генерує всі аудіофайли (метод з AudioMasterWorker)."""
@@ -1174,7 +1184,7 @@ class MainWindow(QMainWindow):
             logging.warning("Queue is already running.")
             return
         
-        if self.task_tab.task_table.rowCount() == 0:
+        if self.task_tab.task_tree.topLevelItemCount() == 0:
             logging.info("Queue is empty. Nothing to start.")
             return
 
@@ -1193,7 +1203,7 @@ class MainWindow(QMainWindow):
             
         self.is_queue_running = False
         # Зупиняємо завдання, тільки якщо його індекс є дійсним
-        if self.current_queue_task_row != -1 and self.current_queue_task_row < self.task_tab.task_table.rowCount():
+        if self.current_queue_task_row != -1 and self.current_queue_task_row < self.task_tab.task_tree.topLevelItemCount():
             self.stop_main_task(self.current_queue_task_row)
 
         self.task_tab.start_queue_btn.setText("▶ Запустити всі завдання")
@@ -1291,7 +1301,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def start_main_task(self, task_row):
-        if task_row >= self.task_tab.task_table.rowCount():
+        if task_row >= self.task_tab.task_tree.topLevelItemCount():
             logging.warning(f"Attempted to start task at invalid row {task_row}. Stopping queue.")
             self.stop_queue()
             return
@@ -1351,7 +1361,7 @@ class MainWindow(QMainWindow):
         
         if self.is_queue_running and success:
             self.current_queue_task_row += 1
-            if self.current_queue_task_row < self.task_tab.task_table.rowCount():
+            if self.current_queue_task_row < self.task_tab.task_tree.topLevelItemCount():
                 logging.info(f"Queue mode: Starting next task (row {self.current_queue_task_row}).")
                 self.start_main_task(self.current_queue_task_row)
             else:
@@ -1414,12 +1424,15 @@ class TaskCreationTab(QWidget):
 
         queue_group = QGroupBox("Черга завдань")
         queue_layout = QVBoxLayout(queue_group)
-        self.task_table = QTableWidget(0, 5)
-        self.task_table.setHorizontalHeaderLabels(["ID", "Папка", "Мови", "Статус", "Дії"])
-        self.task_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.task_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
-        self.task_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        queue_layout.addWidget(self.task_table)
+        self.task_tree = QTreeWidget()
+        self.task_tree.setColumnCount(3)
+        self.task_tree.setHeaderLabels(["Завдання / Мова", "Статус", "Дії"])
+        self.task_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.task_tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.task_tree.header().resizeSection(0, 400) 
+        self.task_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.task_tree.setAlternatingRowColors(True)
+        queue_layout.addWidget(self.task_tree)
 
         queue_controls_layout = QHBoxLayout()
         self.start_queue_btn = QPushButton("▶ Запустити всі завдання")
@@ -1435,7 +1448,7 @@ class TaskCreationTab(QWidget):
     def clear_queue(self):
         if QMessageBox.question(self, "Очистити чергу", "Ви впевнені, що хочете видалити всі завдання з черги?") == QMessageBox.Yes:
             self.settings['tasks'] = []
-            self.task_table.setRowCount(0)
+            self.task_tree.clear()
             logging.info("Task queue cleared.")
 
     def refresh_balances(self):
@@ -1471,102 +1484,114 @@ class TaskCreationTab(QWidget):
                     "lang_statuses": {item.data(Qt.UserRole): "Queued" for item in selected_items}}
         if 'tasks' not in self.settings: self.settings['tasks'] = []
         self.settings['tasks'].append(new_task)
-        self.add_task_to_table(new_task)
+        self.add_task_to_tree(new_task)
         self.work_dir_edit.clear(); self.lang_list_widget.clearSelection()
 
-    def add_task_to_table(self, task):
-        row = self.task_table.rowCount()
-        self.task_table.insertRow(row)
-        self.task_table.setItem(row, 0, QTableWidgetItem(str(task['id'])))
-        self.task_table.setItem(row, 1, QTableWidgetItem(task['work_dir']))
-        self.task_table.setItem(row, 2, QTableWidgetItem(", ".join(task['languages'])))
-        
-        status_widget = QWidget()
-        status_layout = QVBoxLayout(status_widget)
-        status_layout.setContentsMargins(2, 2, 2, 2)
-        for lang_id in task['languages']:
-            status_layout.addWidget(QLabel(f"{lang_id}: {task['lang_statuses'][lang_id]}"))
-        self.task_table.setCellWidget(row, 3, status_widget)
+    def add_task_to_tree(self, task):
+        task_item = QTreeWidgetItem(self.task_tree)
+        task_item.setText(0, f"ID: {task['id']}  |  {os.path.basename(task['work_dir'])}")
+        task_item.setData(0, Qt.UserRole, task['id'])
+        task_item.setExpanded(True)
+        font = task_item.font(0)
+        font.setBold(True)
+        task_item.setFont(0, font)
 
         actions_widget = QWidget()
         actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(4, 2, 4, 2)
+        start_btn, stop_btn, remove_btn = QPushButton("▶"), QPushButton("■"), QPushButton("❌")
+        start_btn.setToolTip("Запустити це завдання"); stop_btn.setToolTip("Зупинити це завдання")
+        remove_btn.setToolTip("Видалити це завдання з черги"); stop_btn.setEnabled(False)
         
-        start_btn = QPushButton("Старт")
-        start_btn.setToolTip("Запустити це завдання")
+        start_btn.clicked.connect(partial(self.on_start_button_clicked, task_item))
+        stop_btn.clicked.connect(partial(self.on_stop_button_clicked, task_item))
+        remove_btn.clicked.connect(partial(self.on_remove_button_clicked, task_item))
         
-        stop_btn = QPushButton("Стоп")
-        stop_btn.setToolTip("Зупинити це завдання")
-        stop_btn.setEnabled(False)
-        
-        remove_btn = QPushButton("Видалити")
-        remove_btn.setToolTip("Видалити це завдання з черги")
+        actions_layout.addWidget(start_btn); actions_layout.addWidget(stop_btn); actions_layout.addWidget(remove_btn)
+        self.task_tree.setItemWidget(task_item, 2, actions_widget)
 
-        start_btn.setProperty("row", row)
-        stop_btn.setProperty("row", row)
-        remove_btn.setProperty("row", row)
+        for lang_id in task['languages']:
+            lang_item = QTreeWidgetItem(task_item)
+            lang_name = self.settings['languages'].get(lang_id, {}).get('name', lang_id)
+            lang_item.setText(0, f"    ↳ {lang_name} ({lang_id})")
+            lang_item.setData(0, Qt.UserRole, lang_id)
 
-        start_btn.clicked.connect(self.on_start_button_clicked)
-        stop_btn.clicked.connect(self.on_stop_button_clicked)
-        remove_btn.clicked.connect(self.on_remove_button_clicked)
-        
-        actions_layout.addWidget(start_btn)
-        actions_layout.addWidget(stop_btn)
-        actions_layout.addWidget(remove_btn)
-        self.task_table.setCellWidget(row, 4, actions_widget)
+            status_widget = QWidget()
+            status_layout = QHBoxLayout(status_widget); status_layout.setContentsMargins(4, 2, 4, 2)
+            progress_bar = QProgressBar(minimumHeight=18, textVisible=True, format="В черзі...")
+            progress_bar.setRange(0, 100); progress_bar.setValue(0)
+            status_layout.addWidget(progress_bar)
+            self.task_tree.setItemWidget(lang_item, 1, status_widget)
 
-    def on_start_button_clicked(self):
-        button = self.sender()
-        row = button.property("row")
-        self.start_task_signal.emit(row)
+    def on_start_button_clicked(self, item):
+        task_id = item.data(0, Qt.UserRole)
+        task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
+        if task_row != -1: self.start_task_signal.emit(task_row)
 
-    def on_stop_button_clicked(self):
-        button = self.sender()
-        row = button.property("row")
-        self.stop_task_signal.emit(row)
+    def on_stop_button_clicked(self, item):
+        task_id = item.data(0, Qt.UserRole)
+        task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
+        if task_row != -1: self.stop_task_signal.emit(task_row)
             
-    def on_remove_button_clicked(self):
-        button = self.sender()
-        row = button.property("row")
+    def on_remove_button_clicked(self, item):
+        task_id = item.data(0, Qt.UserRole)
+        if QMessageBox.question(self, "Видалити завдання", f"Ви впевнені, що хочете видалити завдання #{task_id}?") != QMessageBox.Yes: return
         
-        try:
-            task_id_item = self.task_table.item(row, 0)
-            if not task_id_item:
-                logging.error(f"Cannot remove task at row {row}: item not found.")
-                return
-            
-            task_id = int(task_id_item.text())
-            
-            self.settings['tasks'] = [t for t in self.settings['tasks'] if t['id'] != task_id]
-            self.task_table.removeRow(row)
-            logging.info(f"Task #{task_id} removed from queue.")
-
-            for i in range(row, self.task_table.rowCount()):
-                widget = self.task_table.cellWidget(i, 4)
-                for btn_idx in range(widget.layout().count()):
-                    btn = widget.layout().itemAt(btn_idx).widget()
-                    btn.setProperty("row", i)
-
-        except Exception as e:
-            logging.error(f"Error removing task at row {row}: {e}", exc_info=True)
+        self.settings['tasks'] = [t for t in self.settings['tasks'] if t['id'] != task_id]
+        self.task_tree.invisibleRootItem().removeChild(item)
+        logging.info(f"Task #{task_id} removed from queue.")
         
     def populate_tasks(self):
-        self.task_table.setRowCount(0)
-        for task in self.settings.get('tasks', []): self.add_task_to_table(task)
+        self.task_tree.clear()
+        for task in self.settings.get('tasks', []): self.add_task_to_tree(task)
             
     @Slot(int, int, str)
     def update_task_status(self, task_row, lang_index, status):
-        status_widget = self.task_table.cellWidget(task_row, 3)
-        if status_widget and lang_index < status_widget.layout().count():
-            label = status_widget.layout().itemAt(lang_index).widget()
-            lang_id = self.settings['tasks'][task_row]['languages'][lang_index]
-            label.setText(f"{lang_id}: {status}")
-            self.settings['tasks'][task_row]['lang_statuses'][lang_id] = status
+        if task_row >= len(self.settings['tasks']): return
+        task_id_to_find = self.settings['tasks'][task_row]['id']
+        
+        root = self.task_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            task_item = root.child(i)
+            if task_item.data(0, Qt.UserRole) == task_id_to_find:
+                if lang_index < task_item.childCount():
+                    lang_item = task_item.child(lang_index)
+                    status_widget = self.task_tree.itemWidget(lang_item, 1)
+                    if status_widget:
+                        progress_bar = status_widget.findChild(QProgressBar)
+                        if progress_bar:
+                            progress_value, s_lower = 0, status.lower()
+                            if "scenarios" in s_lower or "prompts" in s_lower: progress_value = 15
+                            elif "images" in s_lower: progress_value = 30
+                            elif "audio" in s_lower: progress_value = 50
+                            elif "subtitles" in s_lower: progress_value = 65
+                            elif "montage" in s_lower: progress_value = 80
+                            elif "finalizing" in s_lower: progress_value = 95
+                            elif "completed" in s_lower: progress_value = 100
+                            elif "failed" in s_lower: progress_value = 100
+                            
+                            progress_bar.setValue(progress_value)
+                            progress_bar.setFormat(status)
+                            
+                            style = ""
+                            if "completed" in s_lower: style = "QProgressBar::chunk { background-color: #4CAF50; }"
+                            elif "failed" in s_lower: style = "QProgressBar::chunk { background-color: #F44336; }"
+                            progress_bar.setStyleSheet(style)
+                break
     
     def set_task_running_state(self, row, is_running):
-        actions_widget = self.task_table.cellWidget(row, 4)
-        if actions_widget:
-            actions_widget.layout().itemAt(0).widget().setEnabled(not is_running) # Start
-            actions_widget.layout().itemAt(1).widget().setEnabled(is_running)     # Stop
+        if row >= len(self.settings['tasks']): return
+        task_id_to_find = self.settings['tasks'][row]['id']
+
+        root = self.task_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            task_item = root.child(i)
+            if task_item.data(0, Qt.UserRole) == task_id_to_find:
+                actions_widget = self.task_tree.itemWidget(task_item, 2)
+                if actions_widget:
+                    actions_widget.layout().itemAt(0).widget().setEnabled(not is_running)
+                    actions_widget.layout().itemAt(1).widget().setEnabled(is_running)
+                break
 
 class SettingsTab(QWidget):
     settings_saved = Signal()
