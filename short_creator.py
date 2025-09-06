@@ -367,29 +367,38 @@ class ElevenLabsBotClient(ApiClient):
     def create_task(self, text, template_uuid=None):
         payload = {"text": text}
         if template_uuid: payload["template_uuid"] = template_uuid
-        try:
-            response = requests.post(f"{self.base_url}/tasks", headers=self.post_headers, json=payload)
-            response.raise_for_status()
-            return response.json(), None
-        except requests.exceptions.RequestException as e:
-            return None, f"ElevenLabsBot Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.post(f"{self.base_url}/tasks", headers=self.post_headers, json=payload)
+                response.raise_for_status()
+                return response.json(), None
+            except requests.exceptions.RequestException as e:
+                error_message = f"ElevenLabsBot Error (create_task): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def get_task_status(self, task_id):
-        try:
-            response = requests.get(f"{self.base_url}/tasks/{task_id}/status", headers=self.get_headers)
-            response.raise_for_status()
-            return response.json(), None
-        except requests.exceptions.RequestException as e:
-            return None, f"ElevenLabsBot Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.get(f"{self.base_url}/tasks/{task_id}/status", headers=self.get_headers)
+                response.raise_for_status()
+                return response.json(), None
+            except requests.exceptions.RequestException as e:
+                error_message = f"ElevenLabsBot Error (get_task_status): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def get_result(self, task_id):
-        try:
-            response = requests.get(f"{self.base_url}/tasks/{task_id}/result", headers=self.get_headers, timeout=120)
-            if response.status_code == 200: return response.content, None
-            elif response.status_code == 202: return "pending", None
-            else: response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            return None, f"ElevenLabsBot Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.get(f"{self.base_url}/tasks/{task_id}/result", headers=self.get_headers, timeout=120)
+                if response.status_code == 200: return response.content, None
+                elif response.status_code == 202: return "pending", None
+                else: response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                error_message = f"ElevenLabsBot Error (get_result): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def test_connection(self):
         if not self.api_key: return False, "API Key is missing."
@@ -430,19 +439,33 @@ class VoicemakerClient(ApiClient):
 
     def generate_audio(self, text, voice_id, lang_code='en-US', engine='neural'):
         payload = {"Engine": engine, "VoiceId": voice_id, "LanguageCode": lang_code, "Text": text, "OutputFormat": "mp3", "SampleRate": "48000"}
-        try:
-            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("success"):
-                audio_url = data.get("path")
-                audio_response = requests.get(audio_url, timeout=120)
-                audio_response.raise_for_status()
-                return audio_response.content, None
-            else:
-                return None, f"Voicemaker Error: {data.get('message', 'Unknown error')}"
-        except requests.exceptions.RequestException as e:
-            return None, f"Voicemaker Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=120)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("success"):
+                    audio_url = data.get("path")
+                    # Вкладений цикл для завантаження аудіофайлу
+                    while True:
+                        try:
+                            audio_response = requests.get(audio_url, timeout=120)
+                            audio_response.raise_for_status()
+                            return audio_response.content, None
+                        except requests.exceptions.RequestException as e:
+                            error_message = f"Voicemaker Error (downloading audio): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                            logging.error(error_message)
+                            time.sleep(15)
+                else:
+                    # Це помилка API, а не з'єднання. Але для надійності додамо повторну спробу.
+                    error_message = f"Voicemaker API Error: {data.get('message', 'Unknown error')}. Retrying in 15 seconds..."
+                    logging.error(error_message)
+                    time.sleep(15)
+
+            except requests.exceptions.RequestException as e:
+                error_message = f"Voicemaker Error (API call): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def test_connection(self):
         if not self.api_key: return False, "API Key is missing."
@@ -993,53 +1016,36 @@ class AudioGenerationWorker(BaseWorker):
             
             if service == 'ElevenLabsBot':
                 client = ElevenLabsBotClient(self.settings['api']['elevenlabs']['api_key'])
-                task_id = None
                 
                 # --- Створення задачі ---
-                while task_id is None:
-                    self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: створюю задачу для {scenario_name}")
-                    task_info, error = client.create_task(text, self.lang_config['voice_template'])
-                    if error:
-                        logging.error(f"Failed to create ElevenLabs task for {scenario_name}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка, повторна спроба...")
-                        time.sleep(10)
-                    else:
-                        task_id = task_info['task_id']
-                        logging.info(f"ElevenLabs task created for {scenario_name}: ID {task_id}.")
+                self.check_killed()
+                self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: створюю задачу для {scenario_name}")
+                task_info, _ = client.create_task(text, self.lang_config['voice_template'])
+                task_id = task_info['task_id']
+                logging.info(f"ElevenLabs task created for {scenario_name}: ID {task_id}.")
                 
                 # --- Очікування обробки ---
                 is_ready_for_download = False
                 while not is_ready_for_download:
                     self.check_killed()
-                    status_info, error = client.get_task_status(task_id)
-                    if error:
-                        logging.error(f"Failed to get status for task {task_id}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка перевірки статусу...")
-                        time.sleep(10)
-                        continue
-                        
+                    status_info, _ = client.get_task_status(task_id)
                     status = status_info.get('status', 'unknown')
                     status_label = status_info.get('status_label', status)
                     self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs ({scenario_name}): {status_label}")
                     logging.info(f"ElevenLabs task {task_id} status: {status_label}")
                     
                     if status == 'error': raise ConnectionError(f"ElevenLabsBot task {task_id} failed: {status_info.get('detail', 'API error')}")
-                    if status in ['ending', 'ending_processed']: 
+                    if status in ['ending', 'ending_processed']:
                         is_ready_for_download = True
                     else:
-                        time.sleep(10)
+                        time.sleep(10) # Продовжуємо чекати, поки задача обробляється
                 
                 # --- Завантаження результату ---
                 while audio_data is None:
                     self.check_killed()
                     self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: завантаження аудіо для {scenario_name}")
-                    data, error = client.get_result(task_id)
-                    if error:
-                        logging.error(f"Failed to download result for {task_id}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка завантаження...")
-                        time.sleep(10)
-                    elif data == "pending":
+                    data, _ = client.get_result(task_id)
+                    if data == "pending":
                         self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: результат ще не готовий...")
                         time.sleep(10)
                     else:
@@ -1047,16 +1053,9 @@ class AudioGenerationWorker(BaseWorker):
 
             elif service == 'Voicemaker':
                 client = VoicemakerClient(self.settings['api']['voicemaker']['api_key'])
-                while audio_data is None:
-                    self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: генерую аудіо для {scenario_name}")
-                    data, error = client.generate_audio(text, self.lang_config['voice_template'])
-                    if error:
-                        logging.error(f"Voicemaker generation for {scenario_name} failed: {error}. Retrying...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: помилка, повторна спроба...")
-                        time.sleep(10)
-                    else:
-                        audio_data = data
+                self.check_killed()
+                self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: генерую аудіо для {scenario_name}")
+                audio_data, _ = client.generate_audio(text, self.lang_config['voice_template'])
             
             if audio_data:
                 self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Аудіо для {scenario_name} збережено!")
