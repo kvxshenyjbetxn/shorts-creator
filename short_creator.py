@@ -537,8 +537,13 @@ class ImageGenerationWorker(BaseWorker):
                 self.check_killed()
                 scenario_name = os.path.basename(path)
                 
+                # Читаємо промпти з файлу і ОЧИЩУЄМО їх від нумерації
+                prompts = []
                 with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
-                    prompts = [line.strip() for line in f if line.strip()]
+                    for line in f:
+                        cleaned_line = re.sub(r'^\d+[\.\)]?\s*', '', line.strip()).strip()
+                        if cleaned_line:
+                            prompts.append(cleaned_line)
                 
                 image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
                 service = self.settings['tasks'][self.parent.task_row]['image_service']
@@ -654,14 +659,14 @@ class MainTaskWorker(QObject):
             scenarios_text, error = client.generate_text(model['id'], messages_scenario, model['temperature'], model['max_tokens'])
             if error: raise ConnectionError(f"Scenario generation failed: {error}")
             
+            # Оновлена логіка для розрізання сценаріїв по нумерації
+            scenarios_raw = re.split(r'\n(?=\d+[\.\)]\s*)', scenarios_text.strip())
             parsed_scenarios = []
-            for line in scenarios_text.split('\n'):
-                line = line.strip()
-                match = re.match(r'^\d+[\.\)]?\s*(.*)', line)
-                if match:
-                    scenario_content = match.group(1).strip()
-                    if scenario_content:
-                        parsed_scenarios.append(scenario_content)
+            for s in scenarios_raw:
+                if s.strip():
+                    cleaned_scenario = re.sub(r'^\d+[\.\)]?\s*', '', s.strip()).strip()
+                    if cleaned_scenario:
+                        parsed_scenarios.append(cleaned_scenario)
             
             if not parsed_scenarios:
                 raise ValueError(f"Could not parse any scenarios from LLM response for {lang_id}")
@@ -680,6 +685,8 @@ class MainTaskWorker(QObject):
                 messages_prompt = [{"role": "system", "content": lang_config['image_prompt_prompt']}, {"role": "user", "content": scenario_text}]
                 prompts_text, error = client.generate_text(model['id'], messages_prompt, model['temperature'], model['max_tokens'])
                 if error: raise ConnectionError(f"Prompt generation failed: {error}")
+                
+                # Промпти зберігаються в файл в оригінальному вигляді з нумерацією
                 with open(os.path.join(scenario_dir, 'image_prompts.txt'), 'w', encoding='utf-8') as f: f.write(prompts_text)
 
         self.scenario_paths = self.get_all_scenario_paths()
