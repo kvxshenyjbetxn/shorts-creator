@@ -273,22 +273,27 @@ class RecraftClient(ApiClient):
         if not self.client: return [], ["Recraft client not initialized."]
         urls, errors = [], []
         for prompt in prompts:
-            try:
-                extra_params = {}
-                if negative_prompt:
-                    extra_params['negative_prompt'] = negative_prompt
-                
-                response = self.client.images.generate(
-                    prompt=prompt, 
-                    style=style, 
-                    model=model, 
-                    n=1, 
-                    size=size,
-                    extra_body=extra_params if extra_params else None
-                )
-                urls.append(response.data[0].url)
-            except Exception as e:
-                errors.append(f"Recraft Error for prompt '{prompt}': {e}")
+            while True: # Безкінечний цикл для поточного промпту
+                try:
+                    extra_params = {}
+                    if negative_prompt:
+                        extra_params['negative_prompt'] = negative_prompt
+                    
+                    response = self.client.images.generate(
+                        prompt=prompt, 
+                        style=style, 
+                        model=model, 
+                        n=1, 
+                        size=size,
+                        extra_body=extra_params if extra_params else None
+                    )
+                    urls.append(response.data[0].url)
+                    break # Виходимо з циклу while, якщо запит успішний
+                except Exception as e:
+                    # Логуємо помилку і чекаємо перед повторною спробою
+                    error_message = f"Recraft Error for prompt '{prompt}': {e}. Retrying in 15 seconds..."
+                    logging.error(error_message)
+                    time.sleep(15)
         return urls, errors
         
     def test_connection(self):
@@ -334,13 +339,16 @@ class PollinationsClient(ApiClient):
         if nologo: params["nologo"] = "true"
         if self.api_key: params["token"] = self.api_key
 
-        try:
-            response = requests.get(url, params=params, timeout=300)
-            response.raise_for_status()
-            return response.content, None
-        except requests.exceptions.RequestException as e:
-            error_text = e.response.text if e.response else str(e)
-            return None, f"Pollinations Error: {error_text}"
+        while True: # Безкінечний цикл для перепідключення
+            try:
+                response = requests.get(url, params=params, timeout=300)
+                response.raise_for_status()
+                return response.content, None
+            except requests.exceptions.RequestException as e:
+                error_text = e.response.text if e.response else str(e)
+                error_message = f"Pollinations Error: {error_text}. Retrying in 15 seconds..."
+                logging.error(error_message) # Логуємо помилку
+                time.sleep(15)
 
     def test_connection(self):
         try:
