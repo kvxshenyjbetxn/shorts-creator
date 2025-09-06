@@ -112,8 +112,14 @@ class QtLogHandler(logging.Handler):
     def __init__(self, log_signal):
         super().__init__()
         self.log_signal = log_signal
+        # Створюємо спеціальний, більш читабельний форматер для GUI
+        gui_formatter = logging.Formatter('%(asctime)s: %(message)s', datefmt='%H:%M:%S')
+        self.setFormatter(gui_formatter)
 
     def emit(self, record):
+        # Ігноруємо повідомлення рівня DEBUG в GUI для чистоти
+        if record.levelno == logging.DEBUG:
+            return
         msg = self.format(record)
         self.log_signal.emit(msg)
 
@@ -124,15 +130,25 @@ def setup_file_logging(level=logging.INFO):
     log_filepath = os.path.join(log_dir, log_filename)
 
     logger = logging.getLogger()
-    logger.setLevel(level)
+    # Завжди встановлюємо найнижчий рівень для root логера,
+    # щоб хендлери могли самі фільтрувати потрібний рівень.
+    logger.setLevel(logging.DEBUG)
 
+    # Видаляємо всі попередні хендлери, щоб уникнути дублювання
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
 
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-
+    # Створюємо ДЕТАЛЬНИЙ форматер для файлу
+    file_formatter = logging.Formatter(
+        '%(asctime)s - [%(levelname)s] - (%(threadName)s) - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Створюємо файловий хендлер
     file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
+    # Файловий хендлер буде записувати все, починаючи з рівня DEBUG
+    file_handler.setLevel(logging.DEBUG)
     logger.addHandler(file_handler)
     
     logging.info(f"Logging initialized. Log file: {log_filepath}")
@@ -166,19 +182,31 @@ class OpenRouterClient(ApiClient):
         }
         
     def _log_api_call(self, request_payload, response_data, error=None):
+        # Ця функція тепер буде логувати тільки якщо увімкнено детальний лог у налаштуваннях
         if not self.detailed_logging:
             return
         
-        req_str = json.dumps(request_payload, indent=2, ensure_ascii=False)
-        res_str = ""
+        # Використовуємо стандартний логер рівня DEBUG
+        log_message = "API Call to OpenRouter"
+        
+        try:
+            req_str = json.dumps(request_payload, indent=2, ensure_ascii=False)
+            log_message += f"\n--- REQUEST ---\n{req_str}"
+        except Exception:
+            log_message += "\n--- REQUEST ---\n<Could not serialize request>"
+
         if error:
-            res_str = str(error)
-        elif isinstance(response_data, dict):
+            log_message += f"\n--- ERROR ---\n{error}"
+        
+        try:
+            # Намагаємось розпарсити відповідь як JSON для красивого виводу
             res_str = json.dumps(response_data, indent=2, ensure_ascii=False)
-        else:
-            res_str = str(response_data)
+            log_message += f"\n--- RESPONSE ---\n{res_str}"
+        except (TypeError, ValueError):
+            # Якщо не вийшло, виводимо як є
+            log_message += f"\n--- RESPONSE (RAW) ---\n{response_data}"
             
-        logging.debug(f"[API Call - OpenRouter]\n>>> REQUEST:\n{req_str}\n\n<<< RESPONSE:\n{res_str}\n" + "="*40)
+        logging.debug(log_message)
 
 
     def generate_text(self, model, messages, temperature, max_tokens):
@@ -508,7 +536,6 @@ class ImageGenerationWorker(BaseWorker):
             for task_row, lang_idx, lang_config, settings, path in self.parent.scenario_paths:
                 self.check_killed()
                 scenario_name = os.path.basename(path)
-                self.parent.status_update.emit(task_row, lang_idx, f"Images for {scenario_name}")
                 
                 with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
                     prompts = [line.strip() for line in f if line.strip()]
@@ -516,26 +543,45 @@ class ImageGenerationWorker(BaseWorker):
                 image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
                 service = self.settings['tasks'][self.parent.task_row]['image_service']
                 
+                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Генерую {len(prompts)} зображень через {service}...")
+                logging.info(f"Starting image generation for {scenario_name} using {service}. Prompts count: {len(prompts)}")
+
                 if service == 'Recraft':
                     cfg = self.settings['api']['recraft']
                     client = RecraftClient(cfg['api_key'])
+                    
+                    # Для Recraft відправляємо всі промти разом, але логуємо кожен окремо
+                    for i, prompt in enumerate(prompts):
+                         logging.info(f"[Recraft] Preparing prompt {i+1}/{len(prompts)} for {scenario_name}: {prompt}")
+                    
+                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: відправляю {len(prompts)} промтів...")
                     urls, errors = client.generate_images(prompts, style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
                     if errors: logging.error("\n".join(errors))
+                    
                     for i, url in enumerate(urls):
                         self.check_killed()
+                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(urls)}")
                         img_data = requests.get(url).content
                         with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
+
                 elif service == 'Pollinations':
                     cfg = self.settings['api']['pollinations']
                     client = PollinationsClient(api_key=cfg.get('token'))
                     for i, prompt in enumerate(prompts):
                         self.check_killed()
-                        self.parent.status_update.emit(task_row, lang_idx, f"Image {i+1}/{len(prompts)} for {scenario_name}")
+                        # Оновлюємо статус для КОЖНОГО промту
+                        status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
+                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Pollinations [{i+1}/{len(prompts)}]: {status_prompt}")
+                        logging.info(f"[Pollinations] Generating image {i+1}/{len(prompts)} for {scenario_name} with prompt: {prompt}")
+
                         img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
-                        if error: logging.error(error)
+                        if error: 
+                            logging.error(error)
+                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка на зображенні {i+1}!")
                         else:
                             with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
                         time.sleep(1)
+
             self.signals.finished.emit(True, "images")
         except InterruptedError:
             logging.warning("ImageGenerationWorker was cancelled.")
@@ -589,7 +635,10 @@ class MainTaskWorker(QObject):
         for lang_idx, lang_config in enumerate(self.lang_configs):
             self.check_killed()
             lang_id = lang_config['id']
-            self.status_update.emit(self.task_row, lang_idx, f"Generating scenarios for {lang_id}")
+            lang_name = lang_config['name']
+            self.status_update.emit(self.task_row, lang_idx, f"📝 Сценарії для '{lang_name}'")
+            logging.info(f"Generating scenarios for language: {lang_name} ({lang_id})")
+
             lang_dir = os.path.join(self.work_dir, lang_id)
             source_file = next((os.path.join(lang_dir, f) for f in ["rewritten_text.txt", "translation.txt"] if os.path.exists(os.path.join(lang_dir, f))), None)
             if not source_file: raise FileNotFoundError(f"Source text file not found for {lang_id}")
@@ -616,15 +665,18 @@ class MainTaskWorker(QObject):
             
             if not parsed_scenarios:
                 raise ValueError(f"Could not parse any scenarios from LLM response for {lang_id}")
+            logging.info(f"Generated {len(parsed_scenarios)} scenarios for {lang_name}.")
 
             shorts_dir = os.path.join(lang_dir, 'shorts')
             
             for i, scenario_text in enumerate(parsed_scenarios):
+                self.check_killed()
                 scenario_dir = os.path.join(shorts_dir, f'scenario_{i+1}')
                 os.makedirs(scenario_dir, exist_ok=True)
                 with open(os.path.join(scenario_dir, 'scenario.txt'), 'w', encoding='utf-8') as f: f.write(scenario_text)
 
-                self.status_update.emit(self.task_row, lang_idx, f"Prompts for scenario {i+1}")
+                self.status_update.emit(self.task_row, lang_idx, f"🖼️ Промти для сценарію {i+1}")
+                logging.info(f"Generating image prompts for scenario {i+1} ({lang_name})...")
                 messages_prompt = [{"role": "system", "content": lang_config['image_prompt_prompt']}, {"role": "user", "content": scenario_text}]
                 prompts_text, error = client.generate_text(model['id'], messages_prompt, model['temperature'], model['max_tokens'])
                 if error: raise ConnectionError(f"Prompt generation failed: {error}")
@@ -717,7 +769,6 @@ class MainTaskWorker(QObject):
         for task_row, lang_idx, lang_config, settings, path in self.scenario_paths:
             self.check_killed()
             scenario_name = os.path.basename(path)
-            self.status_update.emit(task_row, lang_idx, f"Subtitles for {scenario_name}")
             
             audio_path = os.path.join(path, 'audio.mp3')
             ass_path = os.path.join(path, 'subtitles.ass')
@@ -726,6 +777,10 @@ class MainTaskWorker(QObject):
                 logging.warning(f"Audio file not found for {scenario_name}, skipping transcription.")
                 continue
 
+            # --- НОВИЙ РЯДОК ЛОГУВАННЯ ---
+            self.status_update.emit(task_row, lang_idx, f"✒️ Транскрипція для {scenario_name}...")
+            logging.info(f"Starting transcription for {scenario_name}...")
+            
             try:
                 result = model.transcribe(audio_path, verbose=False, word_timestamps=True)
                 
@@ -863,64 +918,77 @@ class AudioGenerationWorker(BaseWorker):
             service = self.lang_config['voice_service']
             audio_data = None
             
+            logging.info(f"Starting audio generation for {scenario_name} using {service}")
+            
             if service == 'ElevenLabsBot':
                 client = ElevenLabsBotClient(self.settings['api']['elevenlabs']['api_key'])
                 task_id = None
+                
+                # --- Створення задачі ---
                 while task_id is None:
                     self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"Creating task for {scenario_name}")
+                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: створюю задачу для {scenario_name}")
                     task_info, error = client.create_task(text, self.lang_config['voice_template'])
                     if error:
-                        logging.error(f"Failed to create task for {scenario_name}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"Task creation failed. Retrying...")
+                        logging.error(f"Failed to create ElevenLabs task for {scenario_name}: {error}. Retrying in 10s...")
+                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка, повторна спроба...")
                         time.sleep(10)
                     else:
                         task_id = task_info['task_id']
-                        logging.info(f"Task created for {scenario_name}: ID {task_id}.")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"Task {task_id} created. Waiting...")
+                        logging.info(f"ElevenLabs task created for {scenario_name}: ID {task_id}.")
                 
+                # --- Очікування обробки ---
                 is_ready_for_download = False
                 while not is_ready_for_download:
                     self.check_killed()
                     status_info, error = client.get_task_status(task_id)
                     if error:
                         logging.error(f"Failed to get status for task {task_id}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"Status check failed. Retrying...")
+                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка перевірки статусу...")
                         time.sleep(10)
                         continue
+                        
                     status = status_info.get('status', 'unknown')
+                    status_label = status_info.get('status_label', status)
+                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs ({scenario_name}): {status_label}")
+                    logging.info(f"ElevenLabs task {task_id} status: {status_label}")
+                    
                     if status == 'error': raise ConnectionError(f"ElevenLabsBot task {task_id} failed: {status_info.get('detail', 'API error')}")
-                    if status in ['ending', 'ending_processed']: is_ready_for_download = True
+                    if status in ['ending', 'ending_processed']: 
+                        is_ready_for_download = True
                     else:
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"Audio for {scenario_name}: {status_info.get('status_label', status)}")
                         time.sleep(10)
                 
+                # --- Завантаження результату ---
                 while audio_data is None:
                     self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"Downloading audio for {scenario_name}")
+                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: завантаження аудіо для {scenario_name}")
                     data, error = client.get_result(task_id)
                     if error:
                         logging.error(f"Failed to download result for {task_id}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"Download failed. Retrying...")
+                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка завантаження...")
                         time.sleep(10)
                     elif data == "pending":
+                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: результат ще не готовий...")
                         time.sleep(10)
                     else:
                         audio_data = data
+
             elif service == 'Voicemaker':
                 client = VoicemakerClient(self.settings['api']['voicemaker']['api_key'])
                 while audio_data is None:
                     self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"Generating audio for {scenario_name}")
+                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: генерую аудіо для {scenario_name}")
                     data, error = client.generate_audio(text, self.lang_config['voice_template'])
                     if error:
                         logging.error(f"Voicemaker generation for {scenario_name} failed: {error}. Retrying...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"Generation failed. Retrying...")
+                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: помилка, повторна спроба...")
                         time.sleep(10)
                     else:
                         audio_data = data
             
             if audio_data:
+                self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Аудіо для {scenario_name} збережено!")
                 with open(audio_path, 'wb') as f: f.write(audio_data)
                 success = True
         except InterruptedError:
@@ -941,7 +1009,10 @@ class SilentMontageWorker(BaseWorker):
         success = False
         scenario_name = os.path.basename(self.scenario_path)
         try:
-            self.signals.status_update.emit(self.task_row, self.lang_idx, f"Montage for {scenario_name}")
+            # --- ОНОВЛЕНИЙ РЯДОК ЛОГУВАННЯ ---
+            self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎞️ Монтаж для {scenario_name}...")
+            logging.info(f"Starting silent montage for {scenario_name}...")
+
             audio_path, img_dir = os.path.join(self.scenario_path, 'audio.mp3'), os.path.join(self.scenario_path, 'images')
             if not all(os.path.exists(p) for p in [audio_path, img_dir]): raise FileNotFoundError("Assets not ready.")
             images = sorted([os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -1547,37 +1618,45 @@ class TaskCreationTab(QWidget):
             
     @Slot(int, int, str)
     def update_task_status(self, task_row, lang_index, status):
-        if task_row >= len(self.settings['tasks']): return
-        task_id_to_find = self.settings['tasks'][task_row]['id']
-        
-        root = self.task_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            task_item = root.child(i)
-            if task_item.data(0, Qt.UserRole) == task_id_to_find:
-                if lang_index < task_item.childCount():
-                    lang_item = task_item.child(lang_index)
-                    status_widget = self.task_tree.itemWidget(lang_item, 1)
-                    if status_widget:
-                        progress_bar = status_widget.findChild(QProgressBar)
-                        if progress_bar:
-                            progress_value, s_lower = 0, status.lower()
-                            if "scenarios" in s_lower or "prompts" in s_lower: progress_value = 15
-                            elif "images" in s_lower: progress_value = 30
-                            elif "audio" in s_lower: progress_value = 50
-                            elif "subtitles" in s_lower: progress_value = 65
-                            elif "montage" in s_lower: progress_value = 80
-                            elif "finalizing" in s_lower: progress_value = 95
-                            elif "completed" in s_lower: progress_value = 100
-                            elif "failed" in s_lower: progress_value = 100
-                            
-                            progress_bar.setValue(progress_value)
-                            progress_bar.setFormat(status)
-                            
-                            style = ""
-                            if "completed" in s_lower: style = "QProgressBar::chunk { background-color: #4CAF50; }"
-                            elif "failed" in s_lower: style = "QProgressBar::chunk { background-color: #F44336; }"
-                            progress_bar.setStyleSheet(style)
-                break
+        if task_row >= self.task_tree.topLevelItemCount(): return
+
+        task_item = self.task_tree.topLevelItem(task_row)
+        if not task_item: return
+
+        if lang_index < task_item.childCount():
+            lang_item = task_item.child(lang_index)
+            status_widget = self.task_tree.itemWidget(lang_item, 1)
+            if status_widget:
+                progress_bar = status_widget.findChild(QProgressBar)
+                if progress_bar:
+                    progress_value, s_lower = 0, status.lower()
+                    
+                    # Більш гнучке визначення прогресу за ключовими словами/емодзі
+                    if "сценарії" in s_lower or "промти" in s_lower: progress_value = 15
+                    elif "🖼️" in status or "зображення" in s_lower: progress_value = 30
+                    elif "🎤" in status or "audio" in s_lower: progress_value = 50
+                    elif "✒️" in status or "subtitles" in s_lower: progress_value = 65
+                    elif "🎞️" in status or "montage" in s_lower: progress_value = 80
+                    elif "🎬" in status or "finalizing" in s_lower: progress_value = 95
+                    elif "✅" in status or "completed" in s_lower: progress_value = 100
+                    elif "❌" in status or "failed" in s_lower: progress_value = 100
+                    
+                    # Якщо статус вже існує, оновлюємо лише текст, зберігаючи прогрес
+                    current_progress = progress_bar.value()
+                    if progress_value == 0 and current_progress > 0:
+                        progress_value = current_progress
+
+                    progress_bar.setValue(progress_value)
+                    progress_bar.setFormat(status)
+                    
+                    style = ""
+                    if "✅" in status or "completed" in s_lower:
+                        style = "QProgressBar::chunk { background-color: #4CAF50; }"
+                    elif "❌" in status or "failed" in s_lower:
+                        style = "QProgressBar::chunk { background-color: #F44336; }"
+                    
+                    if style:
+                        progress_bar.setStyleSheet(style)
     
     def set_task_running_state(self, row, is_running):
         if row >= len(self.settings['tasks']): return
