@@ -209,23 +209,27 @@ class OpenRouterClient(ApiClient):
 
     def generate_text(self, model, messages, temperature, max_tokens):
         payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-        try:
-            response = requests.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload, timeout=180)
-            response.raise_for_status()
-            response_json = response.json()
-            self._log_api_call(payload, response_json)
-            return response_json['choices'][0]['message']['content'], None
-        except requests.exceptions.RequestException as e:
-            error_message = f"OpenRouter Error: {e}"
-            response_json_for_log = {}
+        while True: # Безкінечний цикл для перепідключення
             try:
-                if e.response:
-                    response_json_for_log = e.response.json()
-                    error_details = response_json_for_log
-                    error_message += f" | Details: {error_details.get('error', {}).get('message', 'N/A')}"
-            except (ValueError, AttributeError): pass
-            self._log_api_call(payload, response_json_for_log, error=error_message)
-            return None, error_message
+                response = requests.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload, timeout=180)
+                response.raise_for_status()
+                response_json = response.json()
+                self._log_api_call(payload, response_json)
+                return response_json['choices'][0]['message']['content'], None
+            except requests.exceptions.RequestException as e:
+                error_message = f"OpenRouter Error: {e}. Retrying in 15 seconds..."
+                logging.error(error_message) # Логуємо помилку
+                response_json_for_log = {}
+                try:
+                    if e.response:
+                        response_json_for_log = e.response.json()
+                        error_details = response_json_for_log
+                        error_message += f" | Details: {error_details.get('error', {}).get('message', 'N/A')}"
+                except (ValueError, AttributeError): pass
+                self._log_api_call(payload, response_json_for_log, error=error_message)
+                
+                # Замість того, щоб повертати помилку, чекаємо і пробуємо знову
+                time.sleep(15)
 
     def test_connection(self):
         if not self.api_key: return False, "API Key is missing."
