@@ -1,5 +1,3 @@
-# short_creator.py
-
 import sys
 import os
 import json
@@ -595,6 +593,56 @@ class ImageGenerationWorker(BaseWorker):
             logging.error(f"Image generation failed: {e}", exc_info=True)
             self.signals.finished.emit(False, "images")
 
+class TitleGenerationWorker(BaseWorker):
+    """Генерує назву для кожного сценарію."""
+    def __init__(self, parent_worker):
+        super().__init__(settings=parent_worker.settings)
+        self.parent = parent_worker
+
+    @Slot()
+    def run(self):
+        logging.info("--- Sub-step: Title Generation (running in parallel) ---")
+        try:
+            client = OpenRouterClient(
+                self.settings['api']['openrouter']['api_key'],
+                detailed_logging=self.settings.get('detailed_logging', False)
+            )
+            model = self.settings['api']['openrouter']['models'][0]
+
+            for task_row, lang_idx, lang_config, settings, path in self.parent.scenario_paths:
+                self.check_killed()
+                scenario_name = os.path.basename(path)
+                
+                with open(os.path.join(path, 'scenario.txt'), 'r', encoding='utf-8') as f:
+                    scenario_text = f.read()
+
+                title_prompt = lang_config.get('title_prompt')
+                if not title_prompt:
+                    logging.warning(f"Title prompt is not defined for language {lang_config['id']}. Skipping title generation for {scenario_name}.")
+                    continue
+                
+                self.parent.status_update.emit(task_row, lang_idx, f"✍️ Генерую назву для {scenario_name}...")
+                logging.info(f"Generating title for {scenario_name}...")
+                
+                messages = [{"role": "system", "content": title_prompt}, {"role": "user", "content": scenario_text}]
+                title_text, error = client.generate_text(model['id'], messages, model['temperature'], model['max_tokens'])
+
+                if error:
+                    logging.error(f"Title generation failed for {scenario_name}: {error}")
+                    self.parent.status_update.emit(task_row, lang_idx, f"✍️ Помилка генерації назви!")
+                else:
+                    with open(os.path.join(path, 'title.txt'), 'w', encoding='utf-8') as f:
+                        f.write(title_text.strip())
+                    logging.info(f"Title for {scenario_name} generated successfully.")
+            
+            self.signals.finished.emit(True, "titles")
+        except InterruptedError:
+            logging.warning("TitleGenerationWorker was cancelled.")
+            self.signals.finished.emit(False, "titles")
+        except Exception as e:
+            logging.error(f"Title generation failed: {e}", exc_info=True)
+            self.signals.finished.emit(False, "titles")
+
 class MainTaskWorker(QObject):
     """Керує повним життєвим циклом одного великого завдання (від сценарію до фінального відео)."""
     finished = Signal(bool, object)
@@ -692,14 +740,18 @@ class MainTaskWorker(QObject):
         self.scenario_paths = self.get_all_scenario_paths()
 
     def run_asset_generation_phase(self):
-        """Запускає генерацію картинок і (аудіо + транскрипція) паралельно."""
+        """Запускає генерацію картинок, назв і (аудіо + транскрипція) паралельно."""
         logging.info("--- Step: Parallel Asset Generation ---")
-        self.asset_phase_tasks_remaining = 2
+        self.asset_phase_tasks_remaining = 3 # Змінено на 3
         self.asset_phase_has_errors = False
         
         image_worker = ImageGenerationWorker(self)
         image_worker.signals.finished.connect(self.on_asset_phase_finished)
         self.threadpool.start(image_worker)
+        
+        title_worker = TitleGenerationWorker(self) # Новий воркер
+        title_worker.signals.finished.connect(self.on_asset_phase_finished)
+        self.threadpool.start(title_worker)
         
         audio_transcribe_worker = AudioAndTranscriptionMasterWorker(self)
         audio_transcribe_worker.signals.finished.connect(self.on_asset_phase_finished)
@@ -1016,7 +1068,6 @@ class SilentMontageWorker(BaseWorker):
         success = False
         scenario_name = os.path.basename(self.scenario_path)
         try:
-            # --- ОНОВЛЕНИЙ РЯДОК ЛОГУВАННЯ ---
             self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎞️ Монтаж для {scenario_name}...")
             logging.info(f"Starting silent montage for {scenario_name}...")
 
@@ -1025,8 +1076,23 @@ class SilentMontageWorker(BaseWorker):
             images = sorted([os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
             if not images: raise FileNotFoundError("No images found.")
 
-            output_dir, video_filename = os.path.dirname(self.scenario_path), f"video_{scenario_name.split('_')[-1]}.mp4"
+            # --- Нова логіка для визначення назви файлу ---
+            output_dir = os.path.dirname(self.scenario_path)
+            title_path = os.path.join(self.scenario_path, 'title.txt')
+            video_filename = f"video_{scenario_name.split('_')[-1]}.mp4" # Назва за замовчуванням
+            if os.path.exists(title_path):
+                try:
+                    with open(title_path, 'r', encoding='utf-8') as f:
+                        title = f.read().strip()
+                    if title:
+                        # Очищуємо назву від символів, неприпустимих у назвах файлів
+                        sanitized_title = re.sub(r'[\\/*?:"<>|]', "", title)
+                        video_filename = f"{sanitized_title}.mp4"
+                except Exception as e:
+                    logging.warning(f"Could not read title from {title_path}, using default name. Error: {e}")
+            
             temp_video_path = os.path.join(output_dir, f"temp_{video_filename}")
+            # --- Кінець нової логіки ---
 
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
             total_duration = float(subprocess.check_output(ffprobe_cmd).decode('utf-8').strip())
@@ -1100,11 +1166,25 @@ class FinalizeVideoWorker(BaseWorker):
     def run(self):
         success = False
         s_name = os.path.basename(self.scenario_path); out_dir = os.path.dirname(self.scenario_path)
-        v_filename = f"video_{s_name.split('_')[-1]}.mp4"
+        
+        # --- Нова логіка для визначення назви файлу (ідентична до SilentMontageWorker) ---
+        title_path = os.path.join(self.scenario_path, 'title.txt')
+        v_filename = f"video_{s_name.split('_')[-1]}.mp4" # Назва за замовчуванням
+        if os.path.exists(title_path):
+            try:
+                with open(title_path, 'r', encoding='utf-8') as f:
+                    title = f.read().strip()
+                if title:
+                    sanitized_title = re.sub(r'[\\/*?:"<>|]', "", title)
+                    v_filename = f"{sanitized_title}.mp4"
+            except Exception as e:
+                logging.warning(f"Could not read title from {title_path}, using default name. Error: {e}")
+
         final_path, temp_path, ass_path = os.path.join(out_dir, v_filename), os.path.join(out_dir, f"temp_{v_filename}"), os.path.join(self.scenario_path, 'subtitles.ass')
+        # --- Кінець нової логіки ---
         
         try:
-            self.signals.status_update.emit(self.task_row, self.lang_idx, f"Finalizing {s_name}")
+            self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎬 Finalizing {s_name}")
             if not all(os.path.exists(p) for p in [temp_path, ass_path]): raise FileNotFoundError(f"Missing assets for {s_name}")
 
             safe_ass = ass_path.replace('\\', '/').replace(':', '\\:')
@@ -1803,7 +1883,9 @@ class SettingsTab(QWidget):
         self.lang_name_edit = QLineEdit()
         self.lang_id_edit = QLineEdit()
         self.lang_voice_code_edit = QLineEdit()
-        self.scenario_prompt_edit = QTextEdit(); self.image_prompt_edit = QTextEdit()
+        self.scenario_prompt_edit = QTextEdit()
+        self.image_prompt_edit = QTextEdit()
+        self.title_prompt_edit = QTextEdit() # Нове поле для промпту назви
         self.voice_service_combo = QComboBox(); self.voice_service_combo.addItems(["ElevenLabsBot", "Voicemaker"])
         
         self.voice_template_widget = QWidget()
@@ -1824,6 +1906,7 @@ class SettingsTab(QWidget):
         self.lang_settings_layout.addRow("Код мови для голосу (напр. uk-UA):", self.lang_voice_code_edit)
         self.lang_settings_layout.addRow("Промт для сценаріїв:", self.scenario_prompt_edit)
         self.lang_settings_layout.addRow("Промт для зображень:", self.image_prompt_edit)
+        self.lang_settings_layout.addRow("Промт для назви відео:", self.title_prompt_edit) # Новий рядок
         self.lang_settings_layout.addRow("Сервіс озвучки:", self.voice_service_combo)
         self.lang_settings_layout.addRow("Шаблон/Голос:", self.voice_template_widget)
         
@@ -2160,7 +2243,7 @@ class SettingsTab(QWidget):
             name, lang_id = dialog.get_data()
             if not name or not lang_id: QMessageBox.warning(self, "Помилка", "Назва та ідентифікатор не можуть бути порожніми."); return
             if lang_id in self.settings['languages']: QMessageBox.warning(self, "Помилка", "Мова з таким ідентифікатором вже існує."); return
-            self.settings['languages'][lang_id] = {"id": lang_id, "name": name, "voice_code": "","scenario_prompt": "", "image_prompt_prompt": "","voice_service": "ElevenLabsBot", "voice_template": ""}
+            self.settings['languages'][lang_id] = {"id": lang_id, "name": name, "voice_code": "","scenario_prompt": "", "image_prompt_prompt": "", "title_prompt": "", "voice_service": "ElevenLabsBot", "voice_template": ""}
             item = QListWidgetItem(name); item.setData(Qt.UserRole, lang_id); self.lang_list.addItem(item)
             self.lang_list.setCurrentItem(item); self.refresh_languages.emit()
     def remove_language(self):
@@ -2181,6 +2264,7 @@ class SettingsTab(QWidget):
         self.lang_voice_code_edit.setText(data.get('voice_code', ''))
         self.scenario_prompt_edit.setPlainText(data.get('scenario_prompt', ''))
         self.image_prompt_edit.setPlainText(data.get('image_prompt_prompt', ''))
+        self.title_prompt_edit.setPlainText(data.get('title_prompt', '')) # Новий рядок
         self.voice_service_combo.setCurrentText(data.get('voice_service', 'ElevenLabsBot'))
         self.populate_vm_voices(data.get('voice_code', ''))
         self.toggle_voice_widgets(self.voice_service_combo.currentText())
@@ -2200,7 +2284,16 @@ class SettingsTab(QWidget):
             voice_template = ""
             if service == 'ElevenLabsBot': voice_template = self.eleven_template_combo.currentData()
             elif service == 'Voicemaker': voice_template = self.vm_voice_combo.currentData()
-            self.settings['languages'][lang_id] = {"id": self.lang_id_edit.text(), "name": self.lang_name_edit.text(),"voice_code": self.lang_voice_code_edit.text(),"scenario_prompt": self.scenario_prompt_edit.toPlainText(),"image_prompt_prompt": self.image_prompt_edit.toPlainText(), "voice_service": service, "voice_template": voice_template}
+            self.settings['languages'][lang_id] = {
+                "id": self.lang_id_edit.text(), 
+                "name": self.lang_name_edit.text(),
+                "voice_code": self.lang_voice_code_edit.text(),
+                "scenario_prompt": self.scenario_prompt_edit.toPlainText(),
+                "image_prompt_prompt": self.image_prompt_edit.toPlainText(), 
+                "title_prompt": self.title_prompt_edit.toPlainText(), # Новий рядок
+                "voice_service": service, 
+                "voice_template": voice_template
+            }
             item.setText(f"{self.lang_name_edit.text()} ({lang_id})")
             self.refresh_languages.emit()
     def refresh_voice_templates(self):
