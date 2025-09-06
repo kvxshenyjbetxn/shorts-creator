@@ -1068,7 +1068,6 @@ class SilentMontageWorker(BaseWorker):
         success = False
         scenario_name = os.path.basename(self.scenario_path)
         try:
-            # --- ОНОВЛЕНИЙ РЯДОК ЛОГУВАННЯ ---
             self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎞️ Монтаж для {scenario_name}...")
             logging.info(f"Starting silent montage for {scenario_name}...")
 
@@ -1077,8 +1076,23 @@ class SilentMontageWorker(BaseWorker):
             images = sorted([os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
             if not images: raise FileNotFoundError("No images found.")
 
-            output_dir, video_filename = os.path.dirname(self.scenario_path), f"video_{scenario_name.split('_')[-1]}.mp4"
+            # --- Нова логіка для визначення назви файлу ---
+            output_dir = os.path.dirname(self.scenario_path)
+            title_path = os.path.join(self.scenario_path, 'title.txt')
+            video_filename = f"video_{scenario_name.split('_')[-1]}.mp4" # Назва за замовчуванням
+            if os.path.exists(title_path):
+                try:
+                    with open(title_path, 'r', encoding='utf-8') as f:
+                        title = f.read().strip()
+                    if title:
+                        # Очищуємо назву від символів, неприпустимих у назвах файлів
+                        sanitized_title = re.sub(r'[\\/*?:"<>|]', "", title)
+                        video_filename = f"{sanitized_title}.mp4"
+                except Exception as e:
+                    logging.warning(f"Could not read title from {title_path}, using default name. Error: {e}")
+            
             temp_video_path = os.path.join(output_dir, f"temp_{video_filename}")
+            # --- Кінець нової логіки ---
 
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
             total_duration = float(subprocess.check_output(ffprobe_cmd).decode('utf-8').strip())
@@ -1152,11 +1166,25 @@ class FinalizeVideoWorker(BaseWorker):
     def run(self):
         success = False
         s_name = os.path.basename(self.scenario_path); out_dir = os.path.dirname(self.scenario_path)
-        v_filename = f"video_{s_name.split('_')[-1]}.mp4"
+        
+        # --- Нова логіка для визначення назви файлу (ідентична до SilentMontageWorker) ---
+        title_path = os.path.join(self.scenario_path, 'title.txt')
+        v_filename = f"video_{s_name.split('_')[-1]}.mp4" # Назва за замовчуванням
+        if os.path.exists(title_path):
+            try:
+                with open(title_path, 'r', encoding='utf-8') as f:
+                    title = f.read().strip()
+                if title:
+                    sanitized_title = re.sub(r'[\\/*?:"<>|]', "", title)
+                    v_filename = f"{sanitized_title}.mp4"
+            except Exception as e:
+                logging.warning(f"Could not read title from {title_path}, using default name. Error: {e}")
+
         final_path, temp_path, ass_path = os.path.join(out_dir, v_filename), os.path.join(out_dir, f"temp_{v_filename}"), os.path.join(self.scenario_path, 'subtitles.ass')
+        # --- Кінець нової логіки ---
         
         try:
-            self.signals.status_update.emit(self.task_row, self.lang_idx, f"Finalizing {s_name}")
+            self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎬 Finalizing {s_name}")
             if not all(os.path.exists(p) for p in [temp_path, ass_path]): raise FileNotFoundError(f"Missing assets for {s_name}")
 
             safe_ass = ass_path.replace('\\', '/').replace(':', '\\:')
