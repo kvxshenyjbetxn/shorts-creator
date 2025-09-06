@@ -570,7 +570,6 @@ class ImageGenerationWorker(BaseWorker):
                 self.check_killed()
                 scenario_name = os.path.basename(path)
                 
-                # Читаємо промпти з файлу і ОЧИЩУЄМО їх від нумерації
                 prompts = []
                 with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
                     for line in f:
@@ -579,53 +578,71 @@ class ImageGenerationWorker(BaseWorker):
                             prompts.append(cleaned_line)
                 
                 image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
-                service = self.settings['tasks'][self.parent.task_row]['image_service']
+
+                # --- ОНОВЛЕНА ЛОГІКА ПЕРЕМИКАННЯ З ЛІЧИЛЬНИКОМ СПРОБ ---
                 
-                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Генерую {len(prompts)} зображень через {service}...")
-                logging.info(f"Starting image generation for {scenario_name} using {service}. Prompts count: {len(prompts)}")
-
-                if service == 'Recraft':
-                    cfg = self.settings['api']['recraft']
-                    client = RecraftClient(cfg['api_key'])
+                for i, prompt in enumerate(prompts):
+                    self.check_killed()
+                    is_prompt_generated = False
+                    error_attempts = 0 # Лічильник спроб для поточного промпту
                     
-                    # Для Recraft відправляємо всі промти разом, але логуємо кожен окремо
-                    for i, prompt in enumerate(prompts):
-                         logging.info(f"[Recraft] Preparing prompt {i+1}/{len(prompts)} for {scenario_name}: {prompt}")
-                    
-                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: відправляю {len(prompts)} промтів...")
-                    urls, errors = client.generate_images(prompts, style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
-                    if errors: logging.error("\n".join(errors))
-                    
-                    for i, url in enumerate(urls):
-                        self.check_killed()
-                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(urls)}")
-                        img_data = requests.get(url).content
-                        with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
+                    while not is_prompt_generated:
+                        service = self.parent.current_image_service
+                        
+                        try:
+                            status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
+                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service} [{i+1}/{len(prompts)}]: {status_prompt} (Спроба {error_attempts + 1})")
+                            logging.info(f"[{service}] Generating image {i+1}/{len(prompts)} (Attempt {error_attempts + 1}) for {scenario_name} with prompt: {prompt}")
 
-                elif service == 'Pollinations':
-                    cfg = self.settings['api']['pollinations']
-                    client = PollinationsClient(api_key=cfg.get('token'))
-                    for i, prompt in enumerate(prompts):
-                        self.check_killed()
-                        # Оновлюємо статус для КОЖНОГО промту
-                        status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
-                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Pollinations [{i+1}/{len(prompts)}]: {status_prompt}")
-                        logging.info(f"[Pollinations] Generating image {i+1}/{len(prompts)} for {scenario_name} with prompt: {prompt}")
+                            if service == 'Recraft':
+                                cfg = self.settings['api']['recraft']
+                                client = RecraftClient(cfg['api_key'])
+                                urls, errors = client.generate_images([prompt], style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
+                                if errors: raise RuntimeError("\n".join(errors))
+                                
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(prompts)}")
+                                img_data = requests.get(urls[0]).content
+                                with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
 
-                        img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
-                        if error: 
-                            logging.error(error)
-                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка на зображенні {i+1}!")
-                        else:
-                            with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
-                        time.sleep(1)
+                            elif service == 'Pollinations':
+                                cfg = self.settings['api']['pollinations']
+                                client = PollinationsClient(api_key=cfg.get('token'))
+                                img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
+                                if error: raise RuntimeError(error)
+                                
+                                with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
+                            
+                            is_prompt_generated = True
+                            time.sleep(1)
+
+                        except Exception as e:
+                            logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
+                            error_attempts += 1
+
+                            if error_attempts < 10:
+                                # Якщо спроби ще не вичерпано, просто чекаємо і пробуємо знову ЦЕЙ Ж СЕРВІС
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 15с...")
+                                time.sleep(15)
+                            else:
+                                # Якщо всі 3 спроби були невдалими, перемикаємо сервіс
+                                if self.settings.get('auto_fallback_image_service', True):
+                                    new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
+                                    logging.warning(f"Failed after 3 attempts. Fallback enabled. Switching from {service} to {new_service}.")
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
+                                    self.parent.current_image_service = new_service
+                                    error_attempts = 0 # Скидаємо лічильник для нового сервісу
+                                else:
+                                    # Якщо перемикання вимкнено, продовжуємо нескінченні спроби
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 15с...")
+                                    time.sleep(15)
 
             self.signals.finished.emit(True, "images")
+            
         except InterruptedError:
             logging.warning("ImageGenerationWorker was cancelled.")
             self.signals.finished.emit(False, "images")
         except Exception as e:
-            logging.error(f"Image generation failed: {e}", exc_info=True)
+            logging.error(f"Critical error in ImageGenerationWorker: {e}", exc_info=True)
             self.signals.finished.emit(False, "images")
 
 class TitleGenerationWorker(BaseWorker):
@@ -696,6 +713,8 @@ class MainTaskWorker(QObject):
         self.lock = threading.Lock()
         self.asset_phase_tasks_remaining = 0
         self.asset_phase_has_errors = False
+        # --- НОВИЙ АТРИБУТ ДЛЯ ЗБЕРІГАННЯ ПОТОЧНОГО СЕРВІСУ ---
+        self.current_image_service = self.settings['tasks'][self.task_row]['image_service']
 
     def kill(self):
         self.is_killed.set()
@@ -1437,7 +1456,8 @@ class MainWindow(QMainWindow):
             "tasks": [],
             "default_image_service": "Recraft",
             "clear_queue_on_exit": True,
-            "detailed_logging": False
+            "detailed_logging": False,
+            "auto_fallback_image_service": True
         }
 
     def save_settings(self):
@@ -2059,6 +2079,11 @@ class SettingsTab(QWidget):
         self.clear_queue_checkbox = QCheckBox("Очищати чергу завдань при виході")
         general_layout.addRow(self.clear_queue_checkbox)
         
+        # --- НОВИЙ ВІДЖЕТ ---
+        self.auto_fallback_checkbox = QCheckBox("Автоматично перемикати сервіс зображень при помилці")
+        general_layout.addRow(self.auto_fallback_checkbox)
+        # --- КІНЕЦЬ НОВОГО ВІДЖЕТУ ---
+
         self.preview_btn = QPushButton("Створити попередній перегляд")
         self.preview_btn.setToolTip("Створює тестове відео з поточними налаштуваннями, використовуючи файли з папки /preview")
         self.preview_btn.clicked.connect(self.generate_preview)
@@ -2112,7 +2137,6 @@ class SettingsTab(QWidget):
             self.sub_alignment.setCurrentIndex(index)
 
     def load_settings_to_ui(self):
-        # ... (код завантаження API, кодеків, ефектів руху залишається)
         api = self.settings.get('api', {})
         self.or_api_key.setText(api.get('openrouter', {}).get('api_key', ''))
         recraft_cfg = api.get('recraft', {})
@@ -2178,9 +2202,9 @@ class SettingsTab(QWidget):
         self.max_concurrent_ffmpeg.setValue(ffmpeg.get('max_concurrent', 3))
         self.main_window.task_tab.image_service_combo.setCurrentText(self.settings.get('default_image_service', 'Recraft'))
         self.clear_queue_checkbox.setChecked(self.settings.get('clear_queue_on_exit', True))
+        self.auto_fallback_checkbox.setChecked(self.settings.get('auto_fallback_image_service', True))
 
     def save_all_settings(self):
-        # ... (збереження API, мов, кодеків, ефектів руху залишається)
         self.settings['api']['openrouter']['api_key'] = self.or_api_key.text()
         self.settings['api']['recraft'] = {'api_key': self.recraft_api_key.text(), 'model': self.recraft_model_combo.currentText(),'style': self.recraft_style_combo.currentText(), 'size': self.recraft_size_combo.currentText(),'negative_prompt': self.recraft_negative_prompt.text()}
         self.settings['api']['pollinations'] = {'token': self.pollinations_token.text(), 'model': self.pollinations_model.currentText(),'width': self.pollinations_width.value(), 'height': self.pollinations_height.value(),'nologo': self.pollinations_nologo.isChecked()}
@@ -2227,6 +2251,7 @@ class SettingsTab(QWidget):
         self.settings['default_image_service'] = self.main_window.task_tab.image_service_combo.currentText()
         self.settings['clear_queue_on_exit'] = self.clear_queue_checkbox.isChecked()
         self.settings['detailed_logging'] = self.main_window.log_tab.detailed_log_checkbox.isChecked()
+        self.settings['auto_fallback_image_service'] = self.auto_fallback_checkbox.isChecked()
 
         self.settings_saved.emit()
         QMessageBox.information(self, "Успіх", "Налаштування збережено.")
