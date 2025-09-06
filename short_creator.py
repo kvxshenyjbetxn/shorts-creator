@@ -713,8 +713,19 @@ class MainTaskWorker(QObject):
         self.lock = threading.Lock()
         self.asset_phase_tasks_remaining = 0
         self.asset_phase_has_errors = False
-        # --- НОВИЙ АТРИБУТ ДЛЯ ЗБЕРІГАННЯ ПОТОЧНОГО СЕРВІСУ ---
+        # --- Цей рядок зчитує сервіс для поточного завдання з налаштувань ---
         self.current_image_service = self.settings['tasks'][self.task_row]['image_service']
+
+    @Slot()
+    def switch_service(self):
+        with self.lock:
+            old_service = self.current_image_service
+            new_service = 'Pollinations' if old_service == 'Recraft' else 'Recraft'
+            self.current_image_service = new_service
+            logging.warning(f"Manual override for task #{self.task_id}! Switched image service from {old_service} to {new_service}.")
+            # Оновлюємо статус для всіх мов у поточному завданні
+            for lang_idx, _ in enumerate(self.lang_configs):
+                self.status_update.emit(self.task_row, lang_idx, f"⚙️ Сервіс змінено на {new_service}!")
 
     def kill(self):
         self.is_killed.set()
@@ -1361,6 +1372,7 @@ class MainWindow(QMainWindow):
         self.task_tab.start_task_signal.connect(self.start_main_task)
         self.task_tab.stop_task_signal.connect(self.stop_main_task)
         self.task_tab.start_queue_signal.connect(self.start_queue)
+        self.task_tab.switch_service_signal.connect(self.on_switch_image_service)
         self.settings_tab.settings_saved.connect(self.save_settings)
         self.settings_tab.refresh_languages.connect(self.task_tab.populate_lang_list)
         
@@ -1381,6 +1393,8 @@ class MainWindow(QMainWindow):
         self.task_tab.start_queue_btn.clicked.disconnect()
         self.task_tab.start_queue_btn.clicked.connect(self.stop_queue)
         
+        self.task_tab.global_switch_service_btn.setEnabled(True) # Вмикаємо кнопку тут
+        
         logging.info("Starting task queue...")
         self.current_queue_task_row = 0
         self.start_main_task(self.current_queue_task_row)
@@ -1390,6 +1404,8 @@ class MainWindow(QMainWindow):
             return
             
         self.is_queue_running = False
+        self.task_tab.global_switch_service_btn.setEnabled(False) # Вимикаємо кнопку
+        
         # Зупиняємо завдання, тільки якщо його індекс є дійсним
         if self.current_queue_task_row != -1 and self.current_queue_task_row < self.task_tab.task_tree.topLevelItemCount():
             self.stop_main_task(self.current_queue_task_row)
@@ -1535,6 +1551,41 @@ class MainWindow(QMainWindow):
                 thread.quit()
                 thread.wait(2000)
 
+    # --- НОВИЙ МЕТОД ---
+    @Slot()
+    def on_switch_image_service(self):
+        if not self.is_queue_running or self.current_queue_task_row == -1:
+            logging.warning("Cannot switch service: no task is currently running.")
+            return
+
+        try:
+            active_task_id = self.settings['tasks'][self.current_queue_task_row]['id']
+            if active_task_id not in self.worker_threads:
+                logging.warning(f"Could not find worker for active task ID #{active_task_id}.")
+                return
+            
+            thread, worker = self.worker_threads[active_task_id]
+            if not thread.isRunning():
+                logging.warning(f"Cannot switch service for task #{active_task_id} because it is not running.")
+                return
+
+            # Визначаємо новий сервіс на основі поточного в активному воркері
+            old_service = worker.current_image_service
+            new_service = 'Pollinations' if old_service == 'Recraft' else 'Recraft'
+            
+            # 1. Перемикаємо сервіс для АКТИВНОГО завдання
+            worker.switch_service() 
+            
+            # 2. Перемикаємо сервіс для ВСІХ НАСТУПНИХ завдань у черзі
+            logging.info(f"Updating remaining tasks in the queue to use {new_service}...")
+            for i in range(self.current_queue_task_row + 1, len(self.settings['tasks'])):
+                task_id = self.settings['tasks'][i]['id']
+                self.settings['tasks'][i]['image_service'] = new_service
+                logging.info(f"Task #{task_id} will now use {new_service}.")
+
+        except IndexError:
+            logging.error(f"Error switching service: invalid task row {self.current_queue_task_row}.")
+
     @Slot(bool, object)
     def on_task_finished(self, success, task_id):
         task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
@@ -1565,6 +1616,7 @@ class TaskCreationTab(QWidget):
     start_task_signal = Signal(int)
     stop_task_signal = Signal(int)
     start_queue_signal = Signal()
+    switch_service_signal = Signal() # Сигнал більше не передає ID
 
     def __init__(self, main_window):
         super().__init__()
@@ -1610,6 +1662,17 @@ class TaskCreationTab(QWidget):
         self.add_task_btn.clicked.connect(self.add_task)
         creation_layout.addWidget(self.add_task_btn)
         layout.addWidget(creation_group)
+
+        # --- НОВИЙ БЛОК ДЛЯ КНОПКИ ---
+        switch_service_group = QGroupBox("Керування активним завданням")
+        switch_service_layout = QHBoxLayout(switch_service_group)
+        self.global_switch_service_btn = QPushButton("Перемкнути сервіс зображень")
+        self.global_switch_service_btn.setToolTip("Миттєво перемикає між Recraft та Pollinations для завдання, що виконується")
+        self.global_switch_service_btn.setEnabled(False) # Вимкнена за замовчуванням
+        self.global_switch_service_btn.clicked.connect(self.switch_service_signal.emit)
+        switch_service_layout.addWidget(self.global_switch_service_btn)
+        layout.addWidget(switch_service_group)
+        # --- КІНЕЦЬ НОВОГО БЛОКУ ---
 
         queue_group = QGroupBox("Черга завдань")
         queue_layout = QVBoxLayout(queue_group)
@@ -1721,6 +1784,74 @@ class TaskCreationTab(QWidget):
         task_id = item.data(0, Qt.UserRole)
         task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
         if task_row != -1: self.stop_task_signal.emit(task_row)
+    
+    # --- НОВИЙ МЕТОД ---
+    def on_remove_button_clicked(self, item):
+        task_id = item.data(0, Qt.UserRole)
+        if QMessageBox.question(self, "Видалити завдання", f"Ви впевнені, що хочете видалити завдання #{task_id}?") != QMessageBox.Yes: return
+        
+        self.settings['tasks'] = [t for t in self.settings['tasks'] if t['id'] != task_id]
+        self.task_tree.invisibleRootItem().removeChild(item)
+        logging.info(f"Task #{task_id} removed from queue.")
+        
+    def populate_tasks(self):
+        self.task_tree.clear()
+        for task in self.settings.get('tasks', []): self.add_task_to_tree(task)
+            
+    @Slot(int, int, str)
+    def update_task_status(self, task_row, lang_index, status):
+        if task_row >= self.task_tree.topLevelItemCount(): return
+
+        task_item = self.task_tree.topLevelItem(task_row)
+        if not task_item: return
+
+        if lang_index < task_item.childCount():
+            lang_item = task_item.child(lang_index)
+            status_widget = self.task_tree.itemWidget(lang_item, 1)
+            if status_widget:
+                progress_bar = status_widget.findChild(QProgressBar)
+                if progress_bar:
+                    progress_value, s_lower = 0, status.lower()
+                    
+                    # Більш гнучке визначення прогресу за ключовими словами/емодзі
+                    if "сценарії" in s_lower or "промти" in s_lower: progress_value = 15
+                    elif "⚙️" in status: progress_value = progress_bar.value() # Не змінюємо прогрес при зміні сервісу
+                    elif "🖼️" in status or "зображення" in s_lower: progress_value = 30
+                    elif "🎤" in status or "audio" in s_lower: progress_value = 50
+                    elif "✒️" in status or "subtitles" in s_lower: progress_value = 65
+                    elif "🎞️" in status or "montage" in s_lower: progress_value = 80
+                    elif "🎬" in status or "finalizing" in s_lower: progress_value = 95
+                    elif "✅" in status or "completed" in s_lower: progress_value = 100
+                    elif "❌" in status or "failed" in s_lower: progress_value = 100
+                    
+                    # Якщо статус вже існує, оновлюємо лише текст, зберігаючи прогрес
+                    current_progress = progress_bar.value()
+                    if progress_value == 0 and current_progress > 0:
+                        progress_value = current_progress
+
+                    progress_bar.setValue(progress_value)
+                    progress_bar.setFormat(status)
+                    
+                    style = ""
+                    if "✅" in status or "completed" in s_lower:
+                        style = "QProgressBar::chunk { background-color: #4CAF50; }"
+                    elif "❌" in status or "failed" in s_lower:
+                        style = "QProgressBar::chunk { background-color: #F44336; }"
+                    
+                    if style:
+                        progress_bar.setStyleSheet(style)
+    
+    def set_task_running_state(self, row, is_running):
+        # Керуємо кнопками "старт/стоп" для конкретного завдання
+        if row >= self.task_tree.topLevelItemCount(): return
+        task_item = self.task_tree.topLevelItem(row)
+        if task_item:
+            actions_widget = self.task_tree.itemWidget(task_item, 2)
+            if actions_widget:
+                actions_widget.layout().itemAt(0).widget().setEnabled(not is_running) # start
+                actions_widget.layout().itemAt(1).widget().setEnabled(is_running)   # stop
+        
+        # Глобальна кнопка тепер керується виключно методами start_queue/stop_queue
             
     def on_remove_button_clicked(self, item):
         task_id = item.data(0, Qt.UserRole)
