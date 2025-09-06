@@ -209,23 +209,27 @@ class OpenRouterClient(ApiClient):
 
     def generate_text(self, model, messages, temperature, max_tokens):
         payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-        try:
-            response = requests.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload, timeout=180)
-            response.raise_for_status()
-            response_json = response.json()
-            self._log_api_call(payload, response_json)
-            return response_json['choices'][0]['message']['content'], None
-        except requests.exceptions.RequestException as e:
-            error_message = f"OpenRouter Error: {e}"
-            response_json_for_log = {}
+        while True: # Безкінечний цикл для перепідключення
             try:
-                if e.response:
-                    response_json_for_log = e.response.json()
-                    error_details = response_json_for_log
-                    error_message += f" | Details: {error_details.get('error', {}).get('message', 'N/A')}"
-            except (ValueError, AttributeError): pass
-            self._log_api_call(payload, response_json_for_log, error=error_message)
-            return None, error_message
+                response = requests.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload, timeout=180)
+                response.raise_for_status()
+                response_json = response.json()
+                self._log_api_call(payload, response_json)
+                return response_json['choices'][0]['message']['content'], None
+            except requests.exceptions.RequestException as e:
+                error_message = f"OpenRouter Error: {e}. Retrying in 15 seconds..."
+                logging.error(error_message) # Логуємо помилку
+                response_json_for_log = {}
+                try:
+                    if e.response:
+                        response_json_for_log = e.response.json()
+                        error_details = response_json_for_log
+                        error_message += f" | Details: {error_details.get('error', {}).get('message', 'N/A')}"
+                except (ValueError, AttributeError): pass
+                self._log_api_call(payload, response_json_for_log, error=error_message)
+                
+                # Замість того, щоб повертати помилку, чекаємо і пробуємо знову
+                time.sleep(15)
 
     def test_connection(self):
         if not self.api_key: return False, "API Key is missing."
@@ -269,22 +273,27 @@ class RecraftClient(ApiClient):
         if not self.client: return [], ["Recraft client not initialized."]
         urls, errors = [], []
         for prompt in prompts:
-            try:
-                extra_params = {}
-                if negative_prompt:
-                    extra_params['negative_prompt'] = negative_prompt
-                
-                response = self.client.images.generate(
-                    prompt=prompt, 
-                    style=style, 
-                    model=model, 
-                    n=1, 
-                    size=size,
-                    extra_body=extra_params if extra_params else None
-                )
-                urls.append(response.data[0].url)
-            except Exception as e:
-                errors.append(f"Recraft Error for prompt '{prompt}': {e}")
+            while True: # Безкінечний цикл для поточного промпту
+                try:
+                    extra_params = {}
+                    if negative_prompt:
+                        extra_params['negative_prompt'] = negative_prompt
+                    
+                    response = self.client.images.generate(
+                        prompt=prompt, 
+                        style=style, 
+                        model=model, 
+                        n=1, 
+                        size=size,
+                        extra_body=extra_params if extra_params else None
+                    )
+                    urls.append(response.data[0].url)
+                    break # Виходимо з циклу while, якщо запит успішний
+                except Exception as e:
+                    # Логуємо помилку і чекаємо перед повторною спробою
+                    error_message = f"Recraft Error for prompt '{prompt}': {e}. Retrying in 15 seconds..."
+                    logging.error(error_message)
+                    time.sleep(15)
         return urls, errors
         
     def test_connection(self):
@@ -330,13 +339,16 @@ class PollinationsClient(ApiClient):
         if nologo: params["nologo"] = "true"
         if self.api_key: params["token"] = self.api_key
 
-        try:
-            response = requests.get(url, params=params, timeout=300)
-            response.raise_for_status()
-            return response.content, None
-        except requests.exceptions.RequestException as e:
-            error_text = e.response.text if e.response else str(e)
-            return None, f"Pollinations Error: {error_text}"
+        while True: # Безкінечний цикл для перепідключення
+            try:
+                response = requests.get(url, params=params, timeout=300)
+                response.raise_for_status()
+                return response.content, None
+            except requests.exceptions.RequestException as e:
+                error_text = e.response.text if e.response else str(e)
+                error_message = f"Pollinations Error: {error_text}. Retrying in 15 seconds..."
+                logging.error(error_message) # Логуємо помилку
+                time.sleep(15)
 
     def test_connection(self):
         try:
@@ -355,29 +367,38 @@ class ElevenLabsBotClient(ApiClient):
     def create_task(self, text, template_uuid=None):
         payload = {"text": text}
         if template_uuid: payload["template_uuid"] = template_uuid
-        try:
-            response = requests.post(f"{self.base_url}/tasks", headers=self.post_headers, json=payload)
-            response.raise_for_status()
-            return response.json(), None
-        except requests.exceptions.RequestException as e:
-            return None, f"ElevenLabsBot Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.post(f"{self.base_url}/tasks", headers=self.post_headers, json=payload)
+                response.raise_for_status()
+                return response.json(), None
+            except requests.exceptions.RequestException as e:
+                error_message = f"ElevenLabsBot Error (create_task): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def get_task_status(self, task_id):
-        try:
-            response = requests.get(f"{self.base_url}/tasks/{task_id}/status", headers=self.get_headers)
-            response.raise_for_status()
-            return response.json(), None
-        except requests.exceptions.RequestException as e:
-            return None, f"ElevenLabsBot Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.get(f"{self.base_url}/tasks/{task_id}/status", headers=self.get_headers)
+                response.raise_for_status()
+                return response.json(), None
+            except requests.exceptions.RequestException as e:
+                error_message = f"ElevenLabsBot Error (get_task_status): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def get_result(self, task_id):
-        try:
-            response = requests.get(f"{self.base_url}/tasks/{task_id}/result", headers=self.get_headers, timeout=120)
-            if response.status_code == 200: return response.content, None
-            elif response.status_code == 202: return "pending", None
-            else: response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            return None, f"ElevenLabsBot Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.get(f"{self.base_url}/tasks/{task_id}/result", headers=self.get_headers, timeout=120)
+                if response.status_code == 200: return response.content, None
+                elif response.status_code == 202: return "pending", None
+                else: response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                error_message = f"ElevenLabsBot Error (get_result): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def test_connection(self):
         if not self.api_key: return False, "API Key is missing."
@@ -418,19 +439,33 @@ class VoicemakerClient(ApiClient):
 
     def generate_audio(self, text, voice_id, lang_code='en-US', engine='neural'):
         payload = {"Engine": engine, "VoiceId": voice_id, "LanguageCode": lang_code, "Text": text, "OutputFormat": "mp3", "SampleRate": "48000"}
-        try:
-            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("success"):
-                audio_url = data.get("path")
-                audio_response = requests.get(audio_url, timeout=120)
-                audio_response.raise_for_status()
-                return audio_response.content, None
-            else:
-                return None, f"Voicemaker Error: {data.get('message', 'Unknown error')}"
-        except requests.exceptions.RequestException as e:
-            return None, f"Voicemaker Error: {e.response.text if e.response else e}"
+        while True:
+            try:
+                response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=120)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("success"):
+                    audio_url = data.get("path")
+                    # Вкладений цикл для завантаження аудіофайлу
+                    while True:
+                        try:
+                            audio_response = requests.get(audio_url, timeout=120)
+                            audio_response.raise_for_status()
+                            return audio_response.content, None
+                        except requests.exceptions.RequestException as e:
+                            error_message = f"Voicemaker Error (downloading audio): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                            logging.error(error_message)
+                            time.sleep(15)
+                else:
+                    # Це помилка API, а не з'єднання. Але для надійності додамо повторну спробу.
+                    error_message = f"Voicemaker API Error: {data.get('message', 'Unknown error')}. Retrying in 15 seconds..."
+                    logging.error(error_message)
+                    time.sleep(15)
+
+            except requests.exceptions.RequestException as e:
+                error_message = f"Voicemaker Error (API call): {e.response.text if e.response else e}. Retrying in 15 seconds..."
+                logging.error(error_message)
+                time.sleep(15)
 
     def test_connection(self):
         if not self.api_key: return False, "API Key is missing."
@@ -535,7 +570,6 @@ class ImageGenerationWorker(BaseWorker):
                 self.check_killed()
                 scenario_name = os.path.basename(path)
                 
-                # Читаємо промпти з файлу і ОЧИЩУЄМО їх від нумерації
                 prompts = []
                 with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
                     for line in f:
@@ -544,53 +578,71 @@ class ImageGenerationWorker(BaseWorker):
                             prompts.append(cleaned_line)
                 
                 image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
-                service = self.settings['tasks'][self.parent.task_row]['image_service']
+
+                # --- ОНОВЛЕНА ЛОГІКА ПЕРЕМИКАННЯ З ЛІЧИЛЬНИКОМ СПРОБ ---
                 
-                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Генерую {len(prompts)} зображень через {service}...")
-                logging.info(f"Starting image generation for {scenario_name} using {service}. Prompts count: {len(prompts)}")
-
-                if service == 'Recraft':
-                    cfg = self.settings['api']['recraft']
-                    client = RecraftClient(cfg['api_key'])
+                for i, prompt in enumerate(prompts):
+                    self.check_killed()
+                    is_prompt_generated = False
+                    error_attempts = 0 # Лічильник спроб для поточного промпту
                     
-                    # Для Recraft відправляємо всі промти разом, але логуємо кожен окремо
-                    for i, prompt in enumerate(prompts):
-                         logging.info(f"[Recraft] Preparing prompt {i+1}/{len(prompts)} for {scenario_name}: {prompt}")
-                    
-                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: відправляю {len(prompts)} промтів...")
-                    urls, errors = client.generate_images(prompts, style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
-                    if errors: logging.error("\n".join(errors))
-                    
-                    for i, url in enumerate(urls):
-                        self.check_killed()
-                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(urls)}")
-                        img_data = requests.get(url).content
-                        with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
+                    while not is_prompt_generated:
+                        service = self.parent.current_image_service
+                        
+                        try:
+                            status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
+                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service} [{i+1}/{len(prompts)}]: {status_prompt} (Спроба {error_attempts + 1})")
+                            logging.info(f"[{service}] Generating image {i+1}/{len(prompts)} (Attempt {error_attempts + 1}) for {scenario_name} with prompt: {prompt}")
 
-                elif service == 'Pollinations':
-                    cfg = self.settings['api']['pollinations']
-                    client = PollinationsClient(api_key=cfg.get('token'))
-                    for i, prompt in enumerate(prompts):
-                        self.check_killed()
-                        # Оновлюємо статус для КОЖНОГО промту
-                        status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
-                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Pollinations [{i+1}/{len(prompts)}]: {status_prompt}")
-                        logging.info(f"[Pollinations] Generating image {i+1}/{len(prompts)} for {scenario_name} with prompt: {prompt}")
+                            if service == 'Recraft':
+                                cfg = self.settings['api']['recraft']
+                                client = RecraftClient(cfg['api_key'])
+                                urls, errors = client.generate_images([prompt], style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
+                                if errors: raise RuntimeError("\n".join(errors))
+                                
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(prompts)}")
+                                img_data = requests.get(urls[0]).content
+                                with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
 
-                        img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
-                        if error: 
-                            logging.error(error)
-                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка на зображенні {i+1}!")
-                        else:
-                            with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
-                        time.sleep(1)
+                            elif service == 'Pollinations':
+                                cfg = self.settings['api']['pollinations']
+                                client = PollinationsClient(api_key=cfg.get('token'))
+                                img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
+                                if error: raise RuntimeError(error)
+                                
+                                with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
+                            
+                            is_prompt_generated = True
+                            time.sleep(1)
+
+                        except Exception as e:
+                            logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
+                            error_attempts += 1
+
+                            if error_attempts < 10:
+                                # Якщо спроби ще не вичерпано, просто чекаємо і пробуємо знову ЦЕЙ Ж СЕРВІС
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 15с...")
+                                time.sleep(15)
+                            else:
+                                # Якщо всі 3 спроби були невдалими, перемикаємо сервіс
+                                if self.settings.get('auto_fallback_image_service', True):
+                                    new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
+                                    logging.warning(f"Failed after 3 attempts. Fallback enabled. Switching from {service} to {new_service}.")
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
+                                    self.parent.current_image_service = new_service
+                                    error_attempts = 0 # Скидаємо лічильник для нового сервісу
+                                else:
+                                    # Якщо перемикання вимкнено, продовжуємо нескінченні спроби
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 15с...")
+                                    time.sleep(15)
 
             self.signals.finished.emit(True, "images")
+            
         except InterruptedError:
             logging.warning("ImageGenerationWorker was cancelled.")
             self.signals.finished.emit(False, "images")
         except Exception as e:
-            logging.error(f"Image generation failed: {e}", exc_info=True)
+            logging.error(f"Critical error in ImageGenerationWorker: {e}", exc_info=True)
             self.signals.finished.emit(False, "images")
 
 class TitleGenerationWorker(BaseWorker):
@@ -661,6 +713,19 @@ class MainTaskWorker(QObject):
         self.lock = threading.Lock()
         self.asset_phase_tasks_remaining = 0
         self.asset_phase_has_errors = False
+        # --- Цей рядок зчитує сервіс для поточного завдання з налаштувань ---
+        self.current_image_service = self.settings['tasks'][self.task_row]['image_service']
+
+    @Slot()
+    def switch_service(self):
+        with self.lock:
+            old_service = self.current_image_service
+            new_service = 'Pollinations' if old_service == 'Recraft' else 'Recraft'
+            self.current_image_service = new_service
+            logging.warning(f"Manual override for task #{self.task_id}! Switched image service from {old_service} to {new_service}.")
+            # Оновлюємо статус для всіх мов у поточному завданні
+            for lang_idx, _ in enumerate(self.lang_configs):
+                self.status_update.emit(self.task_row, lang_idx, f"⚙️ Сервіс змінено на {new_service}!")
 
     def kill(self):
         self.is_killed.set()
@@ -981,53 +1046,36 @@ class AudioGenerationWorker(BaseWorker):
             
             if service == 'ElevenLabsBot':
                 client = ElevenLabsBotClient(self.settings['api']['elevenlabs']['api_key'])
-                task_id = None
                 
                 # --- Створення задачі ---
-                while task_id is None:
-                    self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: створюю задачу для {scenario_name}")
-                    task_info, error = client.create_task(text, self.lang_config['voice_template'])
-                    if error:
-                        logging.error(f"Failed to create ElevenLabs task for {scenario_name}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка, повторна спроба...")
-                        time.sleep(10)
-                    else:
-                        task_id = task_info['task_id']
-                        logging.info(f"ElevenLabs task created for {scenario_name}: ID {task_id}.")
+                self.check_killed()
+                self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: створюю задачу для {scenario_name}")
+                task_info, _ = client.create_task(text, self.lang_config['voice_template'])
+                task_id = task_info['task_id']
+                logging.info(f"ElevenLabs task created for {scenario_name}: ID {task_id}.")
                 
                 # --- Очікування обробки ---
                 is_ready_for_download = False
                 while not is_ready_for_download:
                     self.check_killed()
-                    status_info, error = client.get_task_status(task_id)
-                    if error:
-                        logging.error(f"Failed to get status for task {task_id}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка перевірки статусу...")
-                        time.sleep(10)
-                        continue
-                        
+                    status_info, _ = client.get_task_status(task_id)
                     status = status_info.get('status', 'unknown')
                     status_label = status_info.get('status_label', status)
                     self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs ({scenario_name}): {status_label}")
                     logging.info(f"ElevenLabs task {task_id} status: {status_label}")
                     
                     if status == 'error': raise ConnectionError(f"ElevenLabsBot task {task_id} failed: {status_info.get('detail', 'API error')}")
-                    if status in ['ending', 'ending_processed']: 
+                    if status in ['ending', 'ending_processed']:
                         is_ready_for_download = True
                     else:
-                        time.sleep(10)
+                        time.sleep(10) # Продовжуємо чекати, поки задача обробляється
                 
                 # --- Завантаження результату ---
                 while audio_data is None:
                     self.check_killed()
                     self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: завантаження аудіо для {scenario_name}")
-                    data, error = client.get_result(task_id)
-                    if error:
-                        logging.error(f"Failed to download result for {task_id}: {error}. Retrying in 10s...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: помилка завантаження...")
-                        time.sleep(10)
-                    elif data == "pending":
+                    data, _ = client.get_result(task_id)
+                    if data == "pending":
                         self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 ElevenLabs: результат ще не готовий...")
                         time.sleep(10)
                     else:
@@ -1035,16 +1083,9 @@ class AudioGenerationWorker(BaseWorker):
 
             elif service == 'Voicemaker':
                 client = VoicemakerClient(self.settings['api']['voicemaker']['api_key'])
-                while audio_data is None:
-                    self.check_killed()
-                    self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: генерую аудіо для {scenario_name}")
-                    data, error = client.generate_audio(text, self.lang_config['voice_template'])
-                    if error:
-                        logging.error(f"Voicemaker generation for {scenario_name} failed: {error}. Retrying...")
-                        self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: помилка, повторна спроба...")
-                        time.sleep(10)
-                    else:
-                        audio_data = data
+                self.check_killed()
+                self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Voicemaker: генерую аудіо для {scenario_name}")
+                audio_data, _ = client.generate_audio(text, self.lang_config['voice_template'])
             
             if audio_data:
                 self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎤 Аудіо для {scenario_name} збережено!")
@@ -1331,6 +1372,7 @@ class MainWindow(QMainWindow):
         self.task_tab.start_task_signal.connect(self.start_main_task)
         self.task_tab.stop_task_signal.connect(self.stop_main_task)
         self.task_tab.start_queue_signal.connect(self.start_queue)
+        self.task_tab.switch_service_signal.connect(self.on_switch_image_service)
         self.settings_tab.settings_saved.connect(self.save_settings)
         self.settings_tab.refresh_languages.connect(self.task_tab.populate_lang_list)
         
@@ -1351,6 +1393,8 @@ class MainWindow(QMainWindow):
         self.task_tab.start_queue_btn.clicked.disconnect()
         self.task_tab.start_queue_btn.clicked.connect(self.stop_queue)
         
+        self.task_tab.global_switch_service_btn.setEnabled(True) # Вмикаємо кнопку тут
+        
         logging.info("Starting task queue...")
         self.current_queue_task_row = 0
         self.start_main_task(self.current_queue_task_row)
@@ -1360,6 +1404,8 @@ class MainWindow(QMainWindow):
             return
             
         self.is_queue_running = False
+        self.task_tab.global_switch_service_btn.setEnabled(False) # Вимикаємо кнопку
+        
         # Зупиняємо завдання, тільки якщо його індекс є дійсним
         if self.current_queue_task_row != -1 and self.current_queue_task_row < self.task_tab.task_tree.topLevelItemCount():
             self.stop_main_task(self.current_queue_task_row)
@@ -1426,7 +1472,8 @@ class MainWindow(QMainWindow):
             "tasks": [],
             "default_image_service": "Recraft",
             "clear_queue_on_exit": True,
-            "detailed_logging": False
+            "detailed_logging": False,
+            "auto_fallback_image_service": True
         }
 
     def save_settings(self):
@@ -1504,6 +1551,41 @@ class MainWindow(QMainWindow):
                 thread.quit()
                 thread.wait(2000)
 
+    # --- НОВИЙ МЕТОД ---
+    @Slot()
+    def on_switch_image_service(self):
+        if not self.is_queue_running or self.current_queue_task_row == -1:
+            logging.warning("Cannot switch service: no task is currently running.")
+            return
+
+        try:
+            active_task_id = self.settings['tasks'][self.current_queue_task_row]['id']
+            if active_task_id not in self.worker_threads:
+                logging.warning(f"Could not find worker for active task ID #{active_task_id}.")
+                return
+            
+            thread, worker = self.worker_threads[active_task_id]
+            if not thread.isRunning():
+                logging.warning(f"Cannot switch service for task #{active_task_id} because it is not running.")
+                return
+
+            # Визначаємо новий сервіс на основі поточного в активному воркері
+            old_service = worker.current_image_service
+            new_service = 'Pollinations' if old_service == 'Recraft' else 'Recraft'
+            
+            # 1. Перемикаємо сервіс для АКТИВНОГО завдання
+            worker.switch_service() 
+            
+            # 2. Перемикаємо сервіс для ВСІХ НАСТУПНИХ завдань у черзі
+            logging.info(f"Updating remaining tasks in the queue to use {new_service}...")
+            for i in range(self.current_queue_task_row + 1, len(self.settings['tasks'])):
+                task_id = self.settings['tasks'][i]['id']
+                self.settings['tasks'][i]['image_service'] = new_service
+                logging.info(f"Task #{task_id} will now use {new_service}.")
+
+        except IndexError:
+            logging.error(f"Error switching service: invalid task row {self.current_queue_task_row}.")
+
     @Slot(bool, object)
     def on_task_finished(self, success, task_id):
         task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
@@ -1534,6 +1616,7 @@ class TaskCreationTab(QWidget):
     start_task_signal = Signal(int)
     stop_task_signal = Signal(int)
     start_queue_signal = Signal()
+    switch_service_signal = Signal() # Сигнал більше не передає ID
 
     def __init__(self, main_window):
         super().__init__()
@@ -1579,6 +1662,17 @@ class TaskCreationTab(QWidget):
         self.add_task_btn.clicked.connect(self.add_task)
         creation_layout.addWidget(self.add_task_btn)
         layout.addWidget(creation_group)
+
+        # --- НОВИЙ БЛОК ДЛЯ КНОПКИ ---
+        switch_service_group = QGroupBox("Керування активним завданням")
+        switch_service_layout = QHBoxLayout(switch_service_group)
+        self.global_switch_service_btn = QPushButton("Перемкнути сервіс зображень")
+        self.global_switch_service_btn.setToolTip("Миттєво перемикає між Recraft та Pollinations для завдання, що виконується")
+        self.global_switch_service_btn.setEnabled(False) # Вимкнена за замовчуванням
+        self.global_switch_service_btn.clicked.connect(self.switch_service_signal.emit)
+        switch_service_layout.addWidget(self.global_switch_service_btn)
+        layout.addWidget(switch_service_group)
+        # --- КІНЕЦЬ НОВОГО БЛОКУ ---
 
         queue_group = QGroupBox("Черга завдань")
         queue_layout = QVBoxLayout(queue_group)
@@ -1690,6 +1784,74 @@ class TaskCreationTab(QWidget):
         task_id = item.data(0, Qt.UserRole)
         task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
         if task_row != -1: self.stop_task_signal.emit(task_row)
+    
+    # --- НОВИЙ МЕТОД ---
+    def on_remove_button_clicked(self, item):
+        task_id = item.data(0, Qt.UserRole)
+        if QMessageBox.question(self, "Видалити завдання", f"Ви впевнені, що хочете видалити завдання #{task_id}?") != QMessageBox.Yes: return
+        
+        self.settings['tasks'] = [t for t in self.settings['tasks'] if t['id'] != task_id]
+        self.task_tree.invisibleRootItem().removeChild(item)
+        logging.info(f"Task #{task_id} removed from queue.")
+        
+    def populate_tasks(self):
+        self.task_tree.clear()
+        for task in self.settings.get('tasks', []): self.add_task_to_tree(task)
+            
+    @Slot(int, int, str)
+    def update_task_status(self, task_row, lang_index, status):
+        if task_row >= self.task_tree.topLevelItemCount(): return
+
+        task_item = self.task_tree.topLevelItem(task_row)
+        if not task_item: return
+
+        if lang_index < task_item.childCount():
+            lang_item = task_item.child(lang_index)
+            status_widget = self.task_tree.itemWidget(lang_item, 1)
+            if status_widget:
+                progress_bar = status_widget.findChild(QProgressBar)
+                if progress_bar:
+                    progress_value, s_lower = 0, status.lower()
+                    
+                    # Більш гнучке визначення прогресу за ключовими словами/емодзі
+                    if "сценарії" in s_lower or "промти" in s_lower: progress_value = 15
+                    elif "⚙️" in status: progress_value = progress_bar.value() # Не змінюємо прогрес при зміні сервісу
+                    elif "🖼️" in status or "зображення" in s_lower: progress_value = 30
+                    elif "🎤" in status or "audio" in s_lower: progress_value = 50
+                    elif "✒️" in status or "subtitles" in s_lower: progress_value = 65
+                    elif "🎞️" in status or "montage" in s_lower: progress_value = 80
+                    elif "🎬" in status or "finalizing" in s_lower: progress_value = 95
+                    elif "✅" in status or "completed" in s_lower: progress_value = 100
+                    elif "❌" in status or "failed" in s_lower: progress_value = 100
+                    
+                    # Якщо статус вже існує, оновлюємо лише текст, зберігаючи прогрес
+                    current_progress = progress_bar.value()
+                    if progress_value == 0 and current_progress > 0:
+                        progress_value = current_progress
+
+                    progress_bar.setValue(progress_value)
+                    progress_bar.setFormat(status)
+                    
+                    style = ""
+                    if "✅" in status or "completed" in s_lower:
+                        style = "QProgressBar::chunk { background-color: #4CAF50; }"
+                    elif "❌" in status or "failed" in s_lower:
+                        style = "QProgressBar::chunk { background-color: #F44336; }"
+                    
+                    if style:
+                        progress_bar.setStyleSheet(style)
+    
+    def set_task_running_state(self, row, is_running):
+        # Керуємо кнопками "старт/стоп" для конкретного завдання
+        if row >= self.task_tree.topLevelItemCount(): return
+        task_item = self.task_tree.topLevelItem(row)
+        if task_item:
+            actions_widget = self.task_tree.itemWidget(task_item, 2)
+            if actions_widget:
+                actions_widget.layout().itemAt(0).widget().setEnabled(not is_running) # start
+                actions_widget.layout().itemAt(1).widget().setEnabled(is_running)   # stop
+        
+        # Глобальна кнопка тепер керується виключно методами start_queue/stop_queue
             
     def on_remove_button_clicked(self, item):
         task_id = item.data(0, Qt.UserRole)
@@ -2048,6 +2210,11 @@ class SettingsTab(QWidget):
         self.clear_queue_checkbox = QCheckBox("Очищати чергу завдань при виході")
         general_layout.addRow(self.clear_queue_checkbox)
         
+        # --- НОВИЙ ВІДЖЕТ ---
+        self.auto_fallback_checkbox = QCheckBox("Автоматично перемикати сервіс зображень при помилці")
+        general_layout.addRow(self.auto_fallback_checkbox)
+        # --- КІНЕЦЬ НОВОГО ВІДЖЕТУ ---
+
         self.preview_btn = QPushButton("Створити попередній перегляд")
         self.preview_btn.setToolTip("Створює тестове відео з поточними налаштуваннями, використовуючи файли з папки /preview")
         self.preview_btn.clicked.connect(self.generate_preview)
@@ -2101,7 +2268,6 @@ class SettingsTab(QWidget):
             self.sub_alignment.setCurrentIndex(index)
 
     def load_settings_to_ui(self):
-        # ... (код завантаження API, кодеків, ефектів руху залишається)
         api = self.settings.get('api', {})
         self.or_api_key.setText(api.get('openrouter', {}).get('api_key', ''))
         recraft_cfg = api.get('recraft', {})
@@ -2167,9 +2333,9 @@ class SettingsTab(QWidget):
         self.max_concurrent_ffmpeg.setValue(ffmpeg.get('max_concurrent', 3))
         self.main_window.task_tab.image_service_combo.setCurrentText(self.settings.get('default_image_service', 'Recraft'))
         self.clear_queue_checkbox.setChecked(self.settings.get('clear_queue_on_exit', True))
+        self.auto_fallback_checkbox.setChecked(self.settings.get('auto_fallback_image_service', True))
 
     def save_all_settings(self):
-        # ... (збереження API, мов, кодеків, ефектів руху залишається)
         self.settings['api']['openrouter']['api_key'] = self.or_api_key.text()
         self.settings['api']['recraft'] = {'api_key': self.recraft_api_key.text(), 'model': self.recraft_model_combo.currentText(),'style': self.recraft_style_combo.currentText(), 'size': self.recraft_size_combo.currentText(),'negative_prompt': self.recraft_negative_prompt.text()}
         self.settings['api']['pollinations'] = {'token': self.pollinations_token.text(), 'model': self.pollinations_model.currentText(),'width': self.pollinations_width.value(), 'height': self.pollinations_height.value(),'nologo': self.pollinations_nologo.isChecked()}
@@ -2216,6 +2382,7 @@ class SettingsTab(QWidget):
         self.settings['default_image_service'] = self.main_window.task_tab.image_service_combo.currentText()
         self.settings['clear_queue_on_exit'] = self.clear_queue_checkbox.isChecked()
         self.settings['detailed_logging'] = self.main_window.log_tab.detailed_log_checkbox.isChecked()
+        self.settings['auto_fallback_image_service'] = self.auto_fallback_checkbox.isChecked()
 
         self.settings_saved.emit()
         QMessageBox.information(self, "Успіх", "Налаштування збережено.")
