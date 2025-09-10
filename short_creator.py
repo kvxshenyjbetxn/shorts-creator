@@ -570,11 +570,39 @@ class ImageGenerationWorker(BaseWorker):
                 
                 prompts = []
                 with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        cleaned_line = re.sub(r'^\d+[\.\)]?\s*', '', line.strip()).strip()
-                        if cleaned_line:
-                            prompts.append(cleaned_line)
+                    content = f.read().strip()
+                    
+                    # Розділяємо текст за нумерацією (1. 2. 3. тощо)
+                    lines = content.split('\n')
+                    current_prompt = ""
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                            
+                        # Перевіряємо чи рядок починається з нумерації
+                        if re.match(r'^\d+[\.\)]?\s*', line):
+                            # Якщо у нас вже є накопичений промт, зберігаємо його
+                            if current_prompt:
+                                cleaned_prompt = re.sub(r'^\d+[\.\)]?\s*', '', current_prompt).strip()
+                                if cleaned_prompt:
+                                    prompts.append(cleaned_prompt)
+                            
+                            # Починаємо новий промт
+                            current_prompt = line
+                        else:
+                            # Додаємо рядок до поточного промпту
+                            if current_prompt:
+                                current_prompt += " " + line
+                    
+                    # Додаємо останній промт
+                    if current_prompt:
+                        cleaned_prompt = re.sub(r'^\d+[\.\)]?\s*', '', current_prompt).strip()
+                        if cleaned_prompt:
+                            prompts.append(cleaned_prompt)
                 
+                logging.info(f"Знайдено {len(prompts)} промтів для сценарію {scenario_name}")
                 image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
 
                 # --- ОНОВЛЕНА ЛОГІКА ПЕРЕМИКАННЯ З ЛІЧИЛЬНИКОМ СПРОБ ---
