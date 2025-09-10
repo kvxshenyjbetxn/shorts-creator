@@ -616,16 +616,17 @@ class ImageGenerationWorker(BaseWorker):
                         except Exception as e:
                             logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
                             error_attempts += 1
-
-                            if error_attempts < 5:
+                            
+                            max_attempts = self.settings.get('image_service_retry_attempts', 5)
+                            if error_attempts < max_attempts:
                                 # Якщо спроби ще не вичерпано, просто чекаємо і пробуємо знову ЦЕЙ Ж СЕРВІС
                                 self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 10с...")
                                 time.sleep(10)
                             else:
-                                # Якщо всі 5 спроб були невдалими, перемикаємо сервіс
+                                # Якщо всі спроби були невдалими, перемикаємо сервіс
                                 if self.settings.get('auto_fallback_image_service', True):
                                     new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
-                                    logging.warning(f"Failed after 5 attempts. Fallback enabled. Switching from {service} to {new_service}.")
+                                    logging.warning(f"Failed after {max_attempts} attempts. Fallback enabled. Switching from {service} to {new_service}.")
                                     self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
                                     self.parent.current_image_service = new_service
                                     error_attempts = 0 # Скидаємо лічильник для нового сервісу
@@ -1471,7 +1472,8 @@ class MainWindow(QMainWindow):
             "default_image_service": "Recraft",
             "clear_queue_on_exit": True,
             "detailed_logging": False,
-            "auto_fallback_image_service": True
+            "auto_fallback_image_service": True,
+            "image_service_retry_attempts": 5
         }
 
     def save_settings(self):
@@ -2211,6 +2213,14 @@ class SettingsTab(QWidget):
         # --- НОВИЙ ВІДЖЕТ ---
         self.auto_fallback_checkbox = QCheckBox("Автоматично перемикати сервіс зображень при помилці")
         general_layout.addRow(self.auto_fallback_checkbox)
+        
+        # Налаштування кількості спроб перед переключенням
+        self.retry_attempts_spinbox = QSpinBox()
+        self.retry_attempts_spinbox.setMinimum(1)
+        self.retry_attempts_spinbox.setMaximum(20)
+        self.retry_attempts_spinbox.setSuffix(" спроб")
+        self.retry_attempts_spinbox.setToolTip("Кількість невдалих спроб перед переключенням на інший сервіс")
+        general_layout.addRow("Спроб перед переключенням:", self.retry_attempts_spinbox)
         # --- КІНЕЦЬ НОВОГО ВІДЖЕТУ ---
 
         self.preview_btn = QPushButton("Створити попередній перегляд")
@@ -2332,6 +2342,7 @@ class SettingsTab(QWidget):
         self.main_window.task_tab.image_service_combo.setCurrentText(self.settings.get('default_image_service', 'Recraft'))
         self.clear_queue_checkbox.setChecked(self.settings.get('clear_queue_on_exit', True))
         self.auto_fallback_checkbox.setChecked(self.settings.get('auto_fallback_image_service', True))
+        self.retry_attempts_spinbox.setValue(self.settings.get('image_service_retry_attempts', 5))
 
     def save_all_settings(self):
         self.settings['api']['openrouter']['api_key'] = self.or_api_key.text()
@@ -2381,6 +2392,7 @@ class SettingsTab(QWidget):
         self.settings['clear_queue_on_exit'] = self.clear_queue_checkbox.isChecked()
         self.settings['detailed_logging'] = self.main_window.log_tab.detailed_log_checkbox.isChecked()
         self.settings['auto_fallback_image_service'] = self.auto_fallback_checkbox.isChecked()
+        self.settings['image_service_retry_attempts'] = self.retry_attempts_spinbox.value()
 
         self.settings_saved.emit()
         QMessageBox.information(self, "Успіх", "Налаштування збережено.")
