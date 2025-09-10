@@ -339,16 +339,14 @@ class PollinationsClient(ApiClient):
         if nologo: params["nologo"] = "true"
         if self.api_key: params["token"] = self.api_key
 
-        while True: # Безкінечний цикл для перепідключення
-            try:
-                response = requests.get(url, params=params, timeout=300)
-                response.raise_for_status()
-                return response.content, None
-            except requests.exceptions.RequestException as e:
-                error_text = e.response.text if e.response else str(e)
-                error_message = f"Pollinations Error: {error_text}. Retrying in 15 seconds..."
-                logging.error(error_message) # Логуємо помилку
-                time.sleep(15)
+        try:
+            response = requests.get(url, params=params, timeout=300)
+            response.raise_for_status()
+            return response.content, None
+        except requests.exceptions.RequestException as e:
+            error_text = e.response.text if e.response else str(e)
+            error_message = f"Pollinations Error: {error_text}"
+            raise RuntimeError(error_message)
 
     def test_connection(self):
         try:
@@ -587,7 +585,7 @@ class ImageGenerationWorker(BaseWorker):
                     error_attempts = 0 # Лічильник спроб для поточного промпту
                     
                     while not is_prompt_generated:
-                        service = self.parent.current_image_service
+                        service = self.parent.current_image_service  # Читаємо актуальний сервіс щоразу
                         
                         try:
                             status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
@@ -613,28 +611,28 @@ class ImageGenerationWorker(BaseWorker):
                                 with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
                             
                             is_prompt_generated = True
-                            time.sleep(1)
+                            time.sleep(5)
 
                         except Exception as e:
                             logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
                             error_attempts += 1
 
-                            if error_attempts < 10:
+                            if error_attempts < 5:
                                 # Якщо спроби ще не вичерпано, просто чекаємо і пробуємо знову ЦЕЙ Ж СЕРВІС
-                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 15с...")
-                                time.sleep(15)
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 10с...")
+                                time.sleep(10)
                             else:
-                                # Якщо всі 3 спроби були невдалими, перемикаємо сервіс
+                                # Якщо всі 5 спроб були невдалими, перемикаємо сервіс
                                 if self.settings.get('auto_fallback_image_service', True):
                                     new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
-                                    logging.warning(f"Failed after 3 attempts. Fallback enabled. Switching from {service} to {new_service}.")
+                                    logging.warning(f"Failed after 5 attempts. Fallback enabled. Switching from {service} to {new_service}.")
                                     self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
                                     self.parent.current_image_service = new_service
                                     error_attempts = 0 # Скидаємо лічильник для нового сервісу
                                 else:
                                     # Якщо перемикання вимкнено, продовжуємо нескінченні спроби
-                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 15с...")
-                                    time.sleep(15)
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 10с...")
+                                    time.sleep(10)
 
             self.signals.finished.emit(True, "images")
             
