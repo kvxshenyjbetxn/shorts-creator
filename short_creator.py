@@ -579,6 +579,9 @@ class ImageGenerationWorker(BaseWorker):
 
                 # --- ОНОВЛЕНА ЛОГІКА ПЕРЕМИКАННЯ З ЛІЧИЛЬНИКОМ СПРОБ ---
                 
+                # Зберігаємо дефолтний сервіс для повернення після успішної генерації
+                default_service = self.settings.get('default_image_service', 'Recraft')
+                
                 for i, prompt in enumerate(prompts):
                     self.check_killed()
                     is_prompt_generated = False
@@ -611,6 +614,14 @@ class ImageGenerationWorker(BaseWorker):
                                 with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
                             
                             is_prompt_generated = True
+                            
+                            # Якщо ми використовували резервний сервіс і успішно згенерували зображення,
+                            # повертаємося до дефолтного сервісу для наступних зображень
+                            if service != default_service:
+                                logging.info(f"Successfully generated image with fallback service {service}. Returning to default service {default_service}.")
+                                self.parent.current_image_service = default_service
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Повертаюся до {default_service}")
+                            
                             time.sleep(5)
 
                         except Exception as e:
