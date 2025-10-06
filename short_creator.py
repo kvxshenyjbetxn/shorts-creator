@@ -6,6 +6,7 @@ import subprocess
 import threading
 import logging
 import re
+import base64
 from functools import partial
 from datetime import datetime
 from urllib.parse import quote as url_quote
@@ -493,6 +494,92 @@ class VoicemakerClient(ApiClient):
         else:
             raise RuntimeError(f"API returned success=false: {data.get('message', 'Unknown API error')}")
 
+class GooglerClient(ApiClient):
+    def __init__(self, api_key):
+        super().__init__(api_key)
+        self.base_url = "https://app.recrafter.fun/api/v1"
+        self.headers = {"X-API-Key": self.api_key, "Content-Type": "application/json"}
+
+    def generate_images_batch(self, prompts, aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", seed=None):
+        """Генерує всі зображення пачкою. Повертає список base64-encoded data URIs."""
+        if not self.api_key:
+            raise RuntimeError("Googler API key is missing.")
+        
+        images = []
+        for prompt in prompts:
+            payload = {
+                "provider": "google_fx",
+                "operation": "generate",
+                "parameters": {
+                    "prompt": prompt,
+                    "aspect_ratio": aspect_ratio
+                }
+            }
+            if seed is not None:
+                payload["parameters"]["seed"] = seed
+            
+            try:
+                response = requests.post(
+                    f"{self.base_url}/images",
+                    headers=self.headers,
+                    json=payload,
+                    timeout=300
+                )
+                response.raise_for_status()
+                result = response.json()
+                
+                if result.get("success"):
+                    images.append(result.get("result"))
+                else:
+                    error_msg = result.get("error", "Unknown error")
+                    raise RuntimeError(f"Googler API error: {error_msg}")
+                    
+            except requests.exceptions.RequestException as e:
+                error_text = e.response.text if e.response else str(e)
+                raise RuntimeError(f"Googler request failed: {error_text}")
+        
+        return images
+
+    def test_connection(self):
+        if not self.api_key:
+            return False, "API Key is missing."
+        try:
+            response = requests.get(
+                f"{self.base_url}/usage",
+                headers={"X-API-Key": self.api_key},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                limits = data.get("account_limits", {})
+                img_limit = limits.get("img_gen_per_hour_limit", "N/A")
+                return True, f"Success! Image limit: {img_limit}/hour"
+            else:
+                return False, f"Error {response.status_code}: {response.text}"
+        except requests.exceptions.RequestException as e:
+            return False, str(e)
+
+    def get_balance(self):
+        if not self.api_key:
+            return "N/A"
+        try:
+            response = requests.get(
+                f"{self.base_url}/usage",
+                headers={"X-API-Key": self.api_key},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                current_usage = data.get("current_usage", {}).get("hourly_usage", {})
+                img_usage = current_usage.get("image_generation", {})
+                used = img_usage.get("current_usage", 0)
+                limit = data.get("account_limits", {}).get("img_gen_per_hour_limit", 0)
+                remaining = limit - used
+                return f"{remaining}/{limit}"
+            return "Error"
+        except Exception:
+            return "Error"
+
 # #############################################################################
 # # РОБОЧІ ПОТОКИ / WORKER THREADS
 # #############################################################################
@@ -610,69 +697,135 @@ class ImageGenerationWorker(BaseWorker):
                 # Зберігаємо дефолтний сервіс для повернення після успішної генерації
                 default_service = self.settings.get('default_image_service', 'Recraft')
                 
-                for i, prompt in enumerate(prompts):
-                    self.check_killed()
-                    is_prompt_generated = False
-                    error_attempts = 0 # Лічильник спроб для поточного промпту
+                service = self.parent.current_image_service
+                
+                # GOOGLER - ПАЧКОВА ГЕНЕРАЦІЯ (всі зображення одразу)
+                if service == 'Googler':
+                    is_batch_generated = False
+                    error_attempts = 0
                     
-                    while not is_prompt_generated:
-                        service = self.parent.current_image_service  # Читаємо актуальний сервіс щоразу
+                    while not is_batch_generated:
+                        service = self.parent.current_image_service
+                        self.check_killed()
                         
                         try:
-                            status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
-                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service} [{i+1}/{len(prompts)}]: {status_prompt} (Спроба {error_attempts + 1})")
-                            logging.info(f"[{service}] Generating image {i+1}/{len(prompts)} (Attempt {error_attempts + 1}) for {scenario_name} with prompt: {prompt}")
-
-                            if service == 'Recraft':
-                                cfg = self.settings['api']['recraft']
-                                client = RecraftClient(cfg['api_key'])
-                                urls, errors = client.generate_images([prompt], style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
-                                if errors: raise RuntimeError("\n".join(errors))
-                                
-                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(prompts)}")
-                                img_data = requests.get(urls[0]).content
-                                with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
-
-                            elif service == 'Pollinations':
-                                cfg = self.settings['api']['pollinations']
-                                client = PollinationsClient(api_key=cfg.get('token'))
-                                img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
-                                if error: raise RuntimeError(error)
-                                
-                                with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
+                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service}: генерую {len(prompts)} зображень пачкою... (Спроба {error_attempts + 1})")
+                            logging.info(f"[{service}] Batch generating {len(prompts)} images for {scenario_name} (Attempt {error_attempts + 1})")
                             
-                            is_prompt_generated = True
+                            cfg = self.settings['api']['googler']
+                            client = GooglerClient(cfg['api_key'])
+                            images = client.generate_images_batch(
+                                prompts, 
+                                aspect_ratio=cfg.get('aspect_ratio', 'IMAGE_ASPECT_RATIO_PORTRAIT'),
+                                seed=cfg.get('seed')
+                            )
                             
-                            # Якщо ми використовували резервний сервіс і успішно згенерували зображення,
-                            # повертаємося до дефолтного сервісу для наступних зображень
+                            # Зберігаємо всі згенеровані зображення
+                            for i, img_data_uri in enumerate(images):
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service}: зберігаю зображення {i+1}/{len(images)}")
+                                # Витягуємо base64 дані з data URI
+                                header, encoded = img_data_uri.split(",", 1)
+                                img_data = base64.b64decode(encoded)
+                                with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f:
+                                    f.write(img_data)
+                            
+                            is_batch_generated = True
+                            
+                            # Якщо використовували резервний сервіс, повертаємось до дефолтного
                             if service != default_service:
-                                logging.info(f"Successfully generated image with fallback service {service}. Returning to default service {default_service}.")
+                                logging.info(f"Successfully generated batch with fallback service {service}. Returning to default service {default_service}.")
                                 self.parent.current_image_service = default_service
                                 self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Повертаюся до {default_service}")
                             
                             time.sleep(5)
-
+                        
                         except Exception as e:
-                            logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
+                            logging.error(f"Batch image generation failed using {service} (Attempt {error_attempts + 1}): {e}")
                             error_attempts += 1
                             
                             max_attempts = self.settings.get('image_service_retry_attempts', 5)
                             if error_attempts < max_attempts:
-                                # Якщо спроби ще не вичерпано, просто чекаємо і пробуємо знову ЦЕЙ Ж СЕРВІС
                                 self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 10с...")
                                 time.sleep(10)
                             else:
-                                # Якщо всі спроби були невдалими, перемикаємо сервіс
                                 if self.settings.get('auto_fallback_image_service', True):
-                                    new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
+                                    # Для Googler перемикаємося на Recraft або Pollinations
+                                    new_service = 'Recraft' if default_service == 'Recraft' else 'Pollinations'
                                     logging.warning(f"Failed after {max_attempts} attempts. Fallback enabled. Switching from {service} to {new_service}.")
                                     self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
                                     self.parent.current_image_service = new_service
-                                    error_attempts = 0 # Скидаємо лічильник для нового сервісу
+                                    error_attempts = 0
+                                    break  # Виходимо з циклу Googler, щоб перейти до послідовної генерації
                                 else:
-                                    # Якщо перемикання вимкнено, продовжуємо нескінченні спроби
                                     self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 10с...")
                                     time.sleep(10)
+                
+                # RECRAFT / POLLINATIONS - ПОСЛІДОВНА ГЕНЕРАЦІЯ (по одному)
+                if service != 'Googler' or not is_batch_generated:
+                    for i, prompt in enumerate(prompts):
+                        self.check_killed()
+                        is_prompt_generated = False
+                        error_attempts = 0
+                        
+                        while not is_prompt_generated:
+                            service = self.parent.current_image_service
+                            
+                            # Пропускаємо, якщо це Googler (ми вже обробили пачкою)
+                            if service == 'Googler':
+                                break
+                            
+                            try:
+                                status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
+                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service} [{i+1}/{len(prompts)}]: {status_prompt} (Спроба {error_attempts + 1})")
+                                logging.info(f"[{service}] Generating image {i+1}/{len(prompts)} (Attempt {error_attempts + 1}) for {scenario_name} with prompt: {prompt}")
+
+                                if service == 'Recraft':
+                                    cfg = self.settings['api']['recraft']
+                                    client = RecraftClient(cfg['api_key'])
+                                    urls, errors = client.generate_images([prompt], style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
+                                    if errors: raise RuntimeError("\n".join(errors))
+                                    
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(prompts)}")
+                                    img_data = requests.get(urls[0]).content
+                                    with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
+
+                                elif service == 'Pollinations':
+                                    cfg = self.settings['api']['pollinations']
+                                    client = PollinationsClient(api_key=cfg.get('token'))
+                                    img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
+                                    if error: raise RuntimeError(error)
+                                    
+                                    with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
+                                
+                                is_prompt_generated = True
+                                
+                                # Якщо ми використовували резервний сервіс і успішно згенерували зображення,
+                                # повертаємося до дефолтного сервісу для наступних зображень
+                                if service != default_service:
+                                    logging.info(f"Successfully generated image with fallback service {service}. Returning to default service {default_service}.")
+                                    self.parent.current_image_service = default_service
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Повертаюся до {default_service}")
+                                
+                                time.sleep(5)
+
+                            except Exception as e:
+                                logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
+                                error_attempts += 1
+                                
+                                max_attempts = self.settings.get('image_service_retry_attempts', 5)
+                                if error_attempts < max_attempts:
+                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 10с...")
+                                    time.sleep(10)
+                                else:
+                                    if self.settings.get('auto_fallback_image_service', True):
+                                        new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
+                                        logging.warning(f"Failed after {max_attempts} attempts. Fallback enabled. Switching from {service} to {new_service}.")
+                                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
+                                        self.parent.current_image_service = new_service
+                                        error_attempts = 0
+                                    else:
+                                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 10с...")
+                                        time.sleep(10)
 
             self.signals.finished.emit(True, "images")
             
@@ -1695,7 +1848,7 @@ class TaskCreationTab(QWidget):
         self.lang_list_widget = QListWidget(); self.lang_list_widget.setSelectionMode(QListWidget.MultiSelection)
         self.populate_lang_list()
         creation_layout.addRow("Мови для обробки:", self.lang_list_widget)
-        self.image_service_combo = QComboBox(); self.image_service_combo.addItems(["Recraft", "Pollinations"])
+        self.image_service_combo = QComboBox(); self.image_service_combo.addItems(["Recraft", "Pollinations", "Googler"])
         creation_layout.addRow("Сервіс генерації зображень:", self.image_service_combo)
         self.add_task_btn = QPushButton("Додати завдання в чергу")
         self.add_task_btn.clicked.connect(self.add_task)
@@ -2042,6 +2195,26 @@ class SettingsTab(QWidget):
         poll_form.addRow(test_poll_btn)
         img_layout.addWidget(poll_group)
         
+        googler_group = QGroupBox("Googler (Google FX)")
+        googler_form = QFormLayout(googler_group)
+        self.googler_api_key = QLineEdit()
+        googler_key_layout = QHBoxLayout(); googler_key_layout.addWidget(self.googler_api_key)
+        test_googler_btn = QPushButton("Тест"); test_googler_btn.clicked.connect(lambda: self.test_api('googler'))
+        googler_key_layout.addWidget(test_googler_btn)
+        googler_form.addRow("API Key:", googler_key_layout)
+        self.googler_aspect_ratio = QComboBox()
+        self.googler_aspect_ratio.addItems([
+            "IMAGE_ASPECT_RATIO_PORTRAIT", 
+            "IMAGE_ASPECT_RATIO_LANDSCAPE",
+            "IMAGE_ASPECT_RATIO_SQUARE"
+        ])
+        googler_form.addRow("Aspect Ratio:", self.googler_aspect_ratio)
+        self.googler_seed = QSpinBox()
+        self.googler_seed.setRange(0, 999999)
+        self.googler_seed.setSpecialValueText("Random (0)")
+        googler_form.addRow("Seed (0 = random):", self.googler_seed)
+        img_layout.addWidget(googler_group)
+        
         voice_tab = QWidget()
         voice_layout = QFormLayout(voice_tab)
         eleven_group = QGroupBox("ElevenLabsBot")
@@ -2329,6 +2502,10 @@ class SettingsTab(QWidget):
         self.pollinations_width.setValue(poll_cfg.get('width', 1024))
         self.pollinations_height.setValue(poll_cfg.get('height', 1024))
         self.pollinations_nologo.setChecked(poll_cfg.get('nologo', False))
+        googler_cfg = api.get('googler', {})
+        self.googler_api_key.setText(googler_cfg.get('api_key', ''))
+        self.googler_aspect_ratio.setCurrentText(googler_cfg.get('aspect_ratio', 'IMAGE_ASPECT_RATIO_PORTRAIT'))
+        self.googler_seed.setValue(googler_cfg.get('seed') if googler_cfg.get('seed') is not None else 0)
         self.elevenlabs_api_key.setText(api.get('elevenlabs', {}).get('api_key', ''))
         self.voicemaker_api_key.setText(api.get('voicemaker', {}).get('api_key', ''))
         self.or_models_table.setRowCount(0)
@@ -2387,6 +2564,7 @@ class SettingsTab(QWidget):
         self.settings['api']['openrouter']['api_key'] = self.or_api_key.text()
         self.settings['api']['recraft'] = {'api_key': self.recraft_api_key.text(), 'model': self.recraft_model_combo.currentText(),'style': self.recraft_style_combo.currentText(), 'size': self.recraft_size_combo.currentText(),'negative_prompt': self.recraft_negative_prompt.text()}
         self.settings['api']['pollinations'] = {'token': self.pollinations_token.text(), 'model': self.pollinations_model.currentText(),'width': self.pollinations_width.value(), 'height': self.pollinations_height.value(),'nologo': self.pollinations_nologo.isChecked()}
+        self.settings['api']['googler'] = {'api_key': self.googler_api_key.text(), 'aspect_ratio': self.googler_aspect_ratio.currentText(), 'seed': self.googler_seed.value() if self.googler_seed.value() != 0 else None}
         self.settings['api']['elevenlabs']['api_key'] = self.elevenlabs_api_key.text()
         self.settings['api']['voicemaker']['api_key'] = self.voicemaker_api_key.text()
         models = [{"id": self.or_models_table.item(r, 0).text(), "temperature": float(self.or_models_table.cellWidget(r, 1).value()), "max_tokens": int(self.or_models_table.cellWidget(r, 2).value())} for r in range(self.or_models_table.rowCount())]
@@ -2444,7 +2622,7 @@ class SettingsTab(QWidget):
         token_spin = QSpinBox(); token_spin.setRange(1, 32000); token_spin.setValue(tokens); self.or_models_table.setCellWidget(row, 2, token_spin)
         remove_btn = QPushButton("X"); remove_btn.clicked.connect(lambda: self.or_models_table.removeRow(self.or_models_table.indexAt(remove_btn.pos()).row())); self.or_models_table.setCellWidget(row, 3, remove_btn)
     def test_api(self, service_name):
-        client_map = {'openrouter': (OpenRouterClient, self.or_api_key.text()), 'recraft': (RecraftClient, self.recraft_api_key.text()), 'pollinations': (PollinationsClient, None), 'elevenlabs': (ElevenLabsBotClient, self.elevenlabs_api_key.text()), 'voicemaker': (VoicemakerClient, self.voicemaker_api_key.text())}
+        client_map = {'openrouter': (OpenRouterClient, self.or_api_key.text()), 'recraft': (RecraftClient, self.recraft_api_key.text()), 'pollinations': (PollinationsClient, None), 'googler': (GooglerClient, self.googler_api_key.text()), 'elevenlabs': (ElevenLabsBotClient, self.elevenlabs_api_key.text()), 'voicemaker': (VoicemakerClient, self.voicemaker_api_key.text())}
         if service_name not in client_map: return
         client_class, api_key = client_map[service_name]
         client = client_class(api_key)
