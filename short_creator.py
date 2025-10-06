@@ -731,6 +731,12 @@ class ImageGenerationWorker(BaseWorker):
                             
                             is_batch_generated = True
                             
+                            # Оновлюємо статистику Googler після успішної пачкової генерації
+                            main_window = QApplication.instance().activeWindow()
+                            if main_window and hasattr(main_window, 'update_googler_usage_signal'):
+                                main_window.update_googler_usage_signal.emit()
+                                logging.info("Googler usage update requested after batch generation.")
+                            
                             # Якщо використовували резервний сервіс, повертаємось до дефолтного
                             if service != default_service:
                                 logging.info(f"Successfully generated batch with fallback service {service}. Returning to default service {default_service}.")
@@ -1470,7 +1476,7 @@ class BalanceUpdateWorker(BaseWorker):
     def run(self):
         balances = {}
         apis = self.settings.get('api', {})
-        client_map = {'openrouter': OpenRouterClient, 'recraft': RecraftClient, 'elevenlabs': ElevenLabsBotClient, 'voicemaker': VoicemakerClient}
+        client_map = {'openrouter': OpenRouterClient, 'recraft': RecraftClient, 'googler': GooglerClient, 'elevenlabs': ElevenLabsBotClient, 'voicemaker': VoicemakerClient}
         for name, client_class in client_map.items():
             if apis.get(name, {}).get('api_key'):
                 try: balances[name] = client_class(apis[name]['api_key']).get_balance()
@@ -1524,6 +1530,7 @@ class NewLanguageDialog(QDialog):
 
 class MainWindow(QMainWindow):
     log_signal = Signal(str)
+    update_googler_usage_signal = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1564,6 +1571,7 @@ class MainWindow(QMainWindow):
         self.task_tab.stop_task_signal.connect(self.stop_main_task)
         self.task_tab.start_queue_signal.connect(self.start_queue)
         self.task_tab.switch_service_signal.connect(self.on_switch_image_service)
+        self.update_googler_usage_signal.connect(self.update_googler_usage)
         self.settings_tab.settings_saved.connect(self.save_settings)
         self.settings_tab.refresh_languages.connect(self.task_tab.populate_lang_list)
         
@@ -1778,6 +1786,24 @@ class MainWindow(QMainWindow):
         except IndexError:
             logging.error(f"Error switching service: invalid task row {self.current_queue_task_row}.")
 
+    @Slot()
+    def update_googler_usage(self):
+        """Оновлює статистику використання Googler API."""
+        try:
+            googler_cfg = self.settings.get('api', {}).get('googler', {})
+            api_key = googler_cfg.get('api_key')
+            if not api_key:
+                self.task_tab.googler_usage_label.setText("Googler: No API key")
+                return
+            
+            client = GooglerClient(api_key)
+            usage_info = client.get_balance()
+            self.task_tab.googler_usage_label.setText(f"Googler: {usage_info}")
+            logging.info(f"Googler usage updated: {usage_info}")
+        except Exception as e:
+            logging.error(f"Failed to update Googler usage: {e}")
+            self.task_tab.googler_usage_label.setText("Googler: Error")
+
     @Slot(bool, object)
     def on_task_finished(self, success, task_id):
         task_row = next((i for i, t in enumerate(self.settings['tasks']) if t['id'] == task_id), -1)
@@ -1822,16 +1848,19 @@ class TaskCreationTab(QWidget):
     def init_ui(self):
         layout = QVBoxLayout(self)
         
-        balance_group = QGroupBox("Баланси")
+        balance_group = QGroupBox("Баланси та використання")
         balance_layout = QHBoxLayout(balance_group)
         self.openrouter_balance_label = QLabel("OpenRouter: N/A")
         self.recraft_balance_label = QLabel("Recraft: N/A")
+        self.googler_usage_label = QLabel("Googler: N/A")
+        self.googler_usage_label.setStyleSheet("color: #2196F3; font-weight: bold;")
         self.elevenlabs_balance_label = QLabel("ElevenLabsBot: N/A")
         self.voicemaker_balance_label = QLabel("Voicemaker: N/A")
         refresh_btn = QPushButton("Оновити баланси")
         refresh_btn.clicked.connect(self.refresh_balances)
         balance_layout.addWidget(self.openrouter_balance_label)
         balance_layout.addWidget(self.recraft_balance_label)
+        balance_layout.addWidget(self.googler_usage_label)
         balance_layout.addWidget(self.elevenlabs_balance_label)
         balance_layout.addWidget(self.voicemaker_balance_label)
         balance_layout.addStretch()
@@ -1904,6 +1933,8 @@ class TaskCreationTab(QWidget):
     def update_balance_labels(self, balances):
         self.openrouter_balance_label.setText(f"OpenRouter: {balances.get('openrouter', 'N/A')}")
         self.recraft_balance_label.setText(f"Recraft: {balances.get('recraft', 'N/A')}")
+        googler_usage = balances.get('googler', 'N/A')
+        self.googler_usage_label.setText(f"Googler: {googler_usage}")
         self.elevenlabs_balance_label.setText(f"ElevenLabsBot: {balances.get('elevenlabs', 'N/A')}")
         self.voicemaker_balance_label.setText(f"Voicemaker: {balances.get('voicemaker', 'N/A')}")
 
