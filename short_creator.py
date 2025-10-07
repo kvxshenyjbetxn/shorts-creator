@@ -17,11 +17,12 @@ from urllib.parse import quote as url_quote
 # Перед запуском встановіть необхідні бібліотеки:
 # pip install PySide6
 # pip install requests
-# pip install openai-whisper
 # pip install openai
+# pip install pysubs2
 #
 # Також переконайтесь, що у вашій системі встановлено FFmpeg і FFprobe,
 # і вони доступні через системний PATH.
+# Whisper CLI (AMD) вже входить в папку whisper-cli-amd
 # #############################################################################
 
 try:
@@ -38,7 +39,6 @@ try:
     )
     from PySide6.QtGui import QColor, QPalette, QFont, QDesktopServices
     import requests
-    import whisper
     from openai import OpenAI
     import pysubs2
 except ImportError as e:
@@ -102,6 +102,241 @@ def parse_ass_styles(file_path):
         logging.error(f"Failed to parse ASS file {file_path}: {e}")
         return {}
     return styles
+
+def run_whisper_cli_amd(audio_path, language='en', model='base', threads=4, use_gpu=True):
+    """
+    Викликає AMD Whisper CLI для транскрибації аудіо.
+    Повертає шлях до створеного SRT файлу або None при помилці.
+    """
+    try:
+        # Визначення шляху до main.exe
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        amd_exe = os.path.join(script_dir, "whisper-cli-amd", "main.exe")
+        
+        if not os.path.exists(amd_exe):
+            logging.error(f"AMD Whisper не знайдено: {amd_exe}")
+            return None
+        
+        # Визначення моделі
+        model_file = f"ggml-{model}.bin"
+        model_path = os.path.join(script_dir, "whisper-cli-amd", model_file)
+        
+        if not os.path.exists(model_path):
+            logging.error(f"Модель AMD Whisper не знайдена: {model_path}")
+            return None
+        
+        logging.info(f"Використання AMD Whisper: модель {model_file}, мова {language}")
+        
+        # Підготовка команди
+        cmd = [
+            amd_exe,
+            '-m', model_path,
+            '-f', audio_path,
+            '-l', language.lower(),
+            '-osrt',
+            '-t', str(threads),
+            '--no-timestamps'
+        ]
+        
+        if use_gpu:
+            cmd.extend(['-gpu', '0'])
+        
+        logging.info(f"Виконання AMD CLI: {' '.join(cmd)}")
+        
+        # Запуск процесу
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=600
+        )
+        
+        if result.returncode != 0:
+            logging.error(f"AMD Whisper помилка (код {result.returncode}): {result.stderr}")
+            return None
+        
+        # Знайти створений SRT файл
+        expected_srt = f"{audio_path}.srt"
+        if not os.path.exists(expected_srt):
+            base_name = os.path.splitext(audio_path)[0]
+            expected_srt = f"{base_name}.srt"
+        
+        if not os.path.exists(expected_srt):
+            logging.error(f"SRT файл не знайдено після AMD Whisper")
+            return None
+        
+        logging.info(f"SRT файл створено: {expected_srt}")
+        return expected_srt
+        
+    except subprocess.TimeoutExpired:
+        logging.error("AMD Whisper перевищив таймаут (10 хв)")
+        return None
+    except Exception as e:
+        logging.error(f"Помилка AMD Whisper: {e}", exc_info=True)
+        return None
+
+def parse_srt_file(srt_path):
+    """Парсить SRT файл у формат segments [{start, end, text}]."""
+    segments = []
+    
+    try:
+        with open(srt_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        blocks = content.strip().split('\n\n')
+        
+        for block in blocks:
+            lines = block.strip().split('\n')
+            if len(lines) < 3:
+                continue
+            
+            try:
+                timecode_line = lines[1]
+                text_lines = lines[2:]
+                
+                if ' --> ' not in timecode_line:
+                    continue
+                
+                start_str, end_str = timecode_line.split(' --> ')
+                
+                start_sec = srt_time_to_seconds(start_str.strip())
+                end_sec = srt_time_to_seconds(end_str.strip())
+                text = ' '.join(text_lines).strip()
+                
+                if text:
+                    segments.append({
+                        'start': start_sec,
+                        'end': end_sec,
+                        'text': text
+                    })
+            
+            except (ValueError, IndexError) as e:
+                logging.warning(f"Не вдалося розпарсити SRT блок: {e}")
+                continue
+        
+        return segments
+        
+    except Exception as e:
+        logging.error(f"Помилка читання SRT файлу: {e}", exc_info=True)
+        return []
+
+def srt_time_to_seconds(time_str):
+    """Конвертує SRT timestamp '00:00:02,500' в секунди (float)."""
+    time_part, ms_part = time_str.split(',')
+    h, m, s = map(int, time_part.split(':'))
+    ms = int(ms_part)
+    
+    total_seconds = h * 3600 + m * 60 + s + ms / 1000.0
+    return total_seconds
+
+def convert_srt_to_ass_with_settings(srt_path, output_ass_path, sub_settings):
+    """
+    Конвертує SRT файл в ASS зі збереженням стилів з налаштувань.
+    sub_settings - словник з налаштуваннями субтитрів.
+    """
+    try:
+        # 1. Парсинг SRT
+        segments = parse_srt_file(srt_path)
+        
+        if not segments:
+            logging.error("SRT файл порожній або невалідний")
+            return False
+        
+        logging.info(f"Розпарсено {len(segments)} сегментів з SRT")
+        
+        # 2. Конвертація в pysubs2 для обробки
+        subs = pysubs2.SSAFile()
+        
+        # 3. Налаштування стилю з settings
+        def _ass_to_pysubs2_color(ass_color):
+            try:
+                if not ass_color.startswith('&H'):
+                    return pysubs2.Color(255, 255, 255)
+                hex_color = ass_color.lstrip('&H').rstrip('&')
+                if len(hex_color) == 8:
+                    aa, bb, gg, rr = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16), int(hex_color[6:8], 16)
+                    return pysubs2.Color(r=rr, g=gg, b=bb, a=aa)
+                else:
+                    bb, gg, rr = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+                    return pysubs2.Color(r=rr, g=gg, b=bb)
+            except Exception:
+                return pysubs2.Color(255, 255, 255)
+        
+        style = subs.styles["Default"].copy()
+        style.fontname = sub_settings.get('fontname', 'Arial')
+        style.fontsize = float(sub_settings.get('fontsize', 60))
+        style.primarycolor = _ass_to_pysubs2_color(sub_settings.get('primary_color', '&H00FFFFFF'))
+        style.secondarycolor = _ass_to_pysubs2_color(sub_settings.get('secondary_color', '&H000000FF'))
+        style.outlinecolor = _ass_to_pysubs2_color(sub_settings.get('outline_color', '&H00000000'))
+        style.backcolor = _ass_to_pysubs2_color(sub_settings.get('shadow_color', '&H96000000'))
+        style.bold = sub_settings.get('bold', True)
+        style.italic = sub_settings.get('italic', False)
+        style.outline = float(sub_settings.get('outline', 3.0))
+        style.shadow = float(sub_settings.get('shadow', 3.0))
+        
+        # Вирівнювання
+        alignment_map_pysubs2 = {
+            '1': 1, '2': 2, '3': 3,
+            '4': 5, '5': 6, '6': 7,
+            '7': 9, '8': 10, '9': 11
+        }
+        alignment_key = sub_settings.get('alignment', '2')
+        style.alignment = alignment_map_pysubs2.get(alignment_key, 2)
+        
+        style.marginl = int(sub_settings.get('marginl', 20))
+        style.marginr = int(sub_settings.get('marginr', 20))
+        style.marginv = int(sub_settings.get('marginv', 60))
+        
+        subs.styles["Default"] = style
+        
+        # 4. Розбиття довгих сегментів за словами
+        max_words = sub_settings.get('max_words_per_segment', 8)
+        animation = sub_settings.get('animation', 'None')
+        
+        anim_tag = ""
+        if animation == "Fade":
+            anim_tag = "{\\fad(250,250)}"
+        elif animation == "Karaoke":
+            anim_tag = "{\\fad(150,150)}"
+        
+        for segment in segments:
+            words = segment['text'].split()
+            if len(words) <= max_words:
+                # Короткий сегмент - додаємо як є
+                start_time = segment['start'] * 1000
+                end_time = segment['end'] * 1000
+                text = f"{anim_tag}{segment['text']}"
+                event = pysubs2.SSAEvent(start=start_time, end=end_time, text=text)
+                subs.events.append(event)
+            else:
+                # Довгий сегмент - розбиваємо
+                duration = segment['end'] - segment['start']
+                word_duration = duration / len(words)
+                
+                current_pos = 0
+                while current_pos < len(words):
+                    chunk_words = words[current_pos:current_pos + max_words]
+                    chunk_text = " ".join(chunk_words)
+                    
+                    start_time = (segment['start'] + current_pos * word_duration) * 1000
+                    end_time = (segment['start'] + (current_pos + len(chunk_words)) * word_duration) * 1000
+                    
+                    text = f"{anim_tag}{chunk_text}"
+                    event = pysubs2.SSAEvent(start=start_time, end=end_time, text=text)
+                    subs.events.append(event)
+                    
+                    current_pos += max_words
+        
+        # 5. Збереження ASS
+        subs.save(output_ass_path)
+        logging.info(f"ASS файл успішно створено: {output_ass_path}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Помилка конвертації SRT→ASS: {e}", exc_info=True)
+        return False
 
 # #############################################################################
 # # НАЛАШТУВАННЯ ЛОГЕРА
@@ -500,13 +735,20 @@ class GooglerClient(ApiClient):
         self.base_url = "https://app.recrafter.fun/api/v1"
         self.headers = {"X-API-Key": self.api_key, "Content-Type": "application/json"}
 
-    def generate_images_batch(self, prompts, aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", seed=None):
-        """Генерує всі зображення пачкою. Повертає список base64-encoded data URIs."""
+    def generate_images_batch(self, prompts, aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT", seed=None, max_threads=15):
+        """
+        Генерує всі зображення пачкою з обмеженням на кількість паралельних потоків.
+        Повертає список base64-encoded data URIs.
+        """
         if not self.api_key:
             raise RuntimeError("Googler API key is missing.")
         
-        images = []
-        for prompt in prompts:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        images = [None] * len(prompts)  # Зберігаємо порядок
+        
+        def generate_single_image(index, prompt):
+            """Генерує одне зображення та повертає (index, image_data)."""
             payload = {
                 "provider": "google_fx",
                 "operation": "generate",
@@ -529,7 +771,10 @@ class GooglerClient(ApiClient):
                 result = response.json()
                 
                 if result.get("success"):
-                    images.append(result.get("result"))
+                    logging.info(f"Googler: successfully generated image {index + 1}/{len(prompts)}")
+                    # Додаємо невелику затримку між запитами
+                    time.sleep(1)
+                    return (index, result.get("result"))
                 else:
                     error_msg = result.get("error", "Unknown error")
                     raise RuntimeError(f"Googler API error: {error_msg}")
@@ -537,6 +782,19 @@ class GooglerClient(ApiClient):
             except requests.exceptions.RequestException as e:
                 error_text = e.response.text if e.response else str(e)
                 raise RuntimeError(f"Googler request failed: {error_text}")
+        
+        # Використовуємо ThreadPoolExecutor для контролю кількості потоків
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            # Створюємо завдання для кожного промпту
+            future_to_index = {
+                executor.submit(generate_single_image, i, prompt): i 
+                for i, prompt in enumerate(prompts)
+            }
+            
+            # Збираємо результати в правильному порядку
+            for future in as_completed(future_to_index):
+                index, image_data = future.result()
+                images[index] = image_data
         
         return images
 
@@ -642,18 +900,23 @@ class AudioAndTranscriptionMasterWorker(BaseWorker):
             self.signals.finished.emit(success, None)
             
 class ImageGenerationWorker(BaseWorker):
-    """Генерує всі картинки для всіх сценаріїв."""
+    """Генерує всі картинки для всіх сценаріїв одночасно."""
     def __init__(self, parent_worker):
         super().__init__(settings=parent_worker.settings)
         self.parent = parent_worker
 
     @Slot()
+    @Slot()
     def run(self):
-        logging.info("--- Sub-step: Image Generation (running in parallel) ---")
+        logging.info("--- Sub-step: Image Generation (running in parallel for ALL scenarios) ---")
         try:
+            # КРОК 1: Збираємо ВСІ промпти з УСІХ сценаріїв
+            all_prompts_data = []  # Список словників з метаданими
+            
             for task_row, lang_idx, lang_config, settings, path in self.parent.scenario_paths:
                 self.check_killed()
                 scenario_name = os.path.basename(path)
+                logging.info(f"=== Читання промптів для сценарію: {scenario_name} ===")
                 
                 prompts = []
                 with open(os.path.join(path, 'image_prompts.txt'), 'r', encoding='utf-8') as f:
@@ -689,149 +952,198 @@ class ImageGenerationWorker(BaseWorker):
                         if cleaned_prompt:
                             prompts.append(cleaned_prompt)
                 
-                logging.info(f"Знайдено {len(prompts)} промтів для сценарію {scenario_name}")
-                image_dir = os.path.join(path, 'images'); os.makedirs(image_dir, exist_ok=True)
-
-                # --- ОНОВЛЕНА ЛОГІКА ПЕРЕМИКАННЯ З ЛІЧИЛЬНИКОМ СПРОБ ---
+                logging.info(f"Знайдено {len(prompts)} промтів для {scenario_name}")
+                image_dir = os.path.join(path, 'images')
+                os.makedirs(image_dir, exist_ok=True)
                 
-                # Зберігаємо дефолтний сервіс для повернення після успішної генерації
-                default_service = self.settings.get('default_image_service', 'Recraft')
+                # Додаємо промпти з метаданими до загального списку
+                for img_idx, prompt in enumerate(prompts, start=1):
+                    all_prompts_data.append({
+                        'prompt': prompt,
+                        'scenario_path': path,
+                        'scenario_name': scenario_name,
+                        'image_dir': image_dir,
+                        'image_index': img_idx,
+                        'task_row': task_row,
+                        'lang_idx': lang_idx
+                    })
+            
+            # КРОК 2: Генеруємо ВСІ картинки одночасно
+            total_images = len(all_prompts_data)
+            logging.info(f"=== Всього картинок для генерації: {total_images} ===")
+            
+            if total_images == 0:
+                logging.warning("Немає промптів для генерації")
+                self.signals.finished.emit(True, "images")
+                return
+            
+            # Дефолтний сервіс
+            default_service = self.settings.get('default_image_service', 'Recraft')
+            service = self.parent.current_image_service
+            
+            # GOOGLER - ПАЧКОВА ГЕНЕРАЦІЯ (всі зображення одразу для ВСІХ сценаріїв)
+            if service == 'Googler':
+                error_attempts = 0
+                is_generated = False
                 
-                service = self.parent.current_image_service
-                
-                # GOOGLER - ПАЧКОВА ГЕНЕРАЦІЯ (всі зображення одразу)
-                if service == 'Googler':
-                    is_batch_generated = False
-                    error_attempts = 0
+                while not is_generated:
+                    service = self.parent.current_image_service
+                    self.check_killed()
                     
-                    while not is_batch_generated:
+                    try:
+                        # Оновлюємо статус
+                        if all_prompts_data:
+                            first_item = all_prompts_data[0]
+                            self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
+                                                          f"🖼️ {service}: генерую {total_images} зображень (15 потоків)... (Спроба {error_attempts + 1})")
+                        logging.info(f"[{service}] Batch generating {total_images} images for ALL scenarios (Attempt {error_attempts + 1})")
+                        
+                        cfg = self.settings['api']['googler']
+                        client = GooglerClient(cfg['api_key'])
+                        
+                        # Витягуємо тільки промпти для API
+                        all_prompts = [item['prompt'] for item in all_prompts_data]
+                        
+                        # Генеруємо ВСІ зображення одночасно (15 потоків)
+                        images = client.generate_images_batch(
+                            all_prompts, 
+                            aspect_ratio=cfg.get('aspect_ratio', 'IMAGE_ASPECT_RATIO_PORTRAIT'),
+                            seed=cfg.get('seed')
+                        )
+                        
+                        # Зберігаємо кожне зображення у відповідну папку
+                        for i, (item, img_data_uri) in enumerate(zip(all_prompts_data, images)):
+                            self.parent.status_update.emit(item['task_row'], item['lang_idx'], 
+                                                          f"🖼️ Зберігаю {i+1}/{total_images}: {item['scenario_name']}/img_{item['image_index']}.jpg")
+                            
+                            # Витягуємо base64 дані з data URI
+                            header, encoded = img_data_uri.split(",", 1)
+                            img_data = base64.b64decode(encoded)
+                            
+                            # Зберігаємо у відповідну папку з відповідним індексом
+                            img_path = os.path.join(item['image_dir'], f"img_{item['image_index']}.jpg")
+                            with open(img_path, 'wb') as f:
+                                f.write(img_data)
+                            
+                            logging.info(f"Saved: {item['scenario_name']}/img_{item['image_index']}.jpg")
+                        
+                        is_generated = True
+                        logging.info(f"✓ Успішно згенеровано і збережено {total_images} зображень для всіх сценаріїв")
+                        
+                        # Оновлюємо статистику Googler
+                        main_window = QApplication.instance().activeWindow()
+                        if main_window and hasattr(main_window, 'update_googler_usage_signal'):
+                            main_window.update_googler_usage_signal.emit()
+                            logging.info("Googler usage update requested after batch generation.")
+                        
+                        # Якщо використовували резервний сервіс, повертаємось до дефолтного
+                        if service != default_service:
+                            logging.info(f"Successfully generated batch. Returning to default service {default_service}.")
+                            self.parent.current_image_service = default_service
+                    
+                    except Exception as e:
+                        logging.error(f"Batch image generation failed using {service} (Attempt {error_attempts + 1}): {e}")
+                        error_attempts += 1
+                        
+                        max_attempts = self.settings.get('image_service_retry_attempts', 5)
+                        if error_attempts < max_attempts:
+                            if all_prompts_data:
+                                first_item = all_prompts_data[0]
+                                self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
+                                                              f"🖼️ Помилка {service}, повторна спроба через 10с...")
+                            time.sleep(10)
+                        else:
+                            if self.settings.get('auto_fallback_image_service', True):
+                                new_service = 'Recraft' if default_service == 'Recraft' else 'Pollinations'
+                                logging.warning(f"Failed after {max_attempts} attempts. Switching to {new_service}.")
+                                if all_prompts_data:
+                                    first_item = all_prompts_data[0]
+                                    self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
+                                                                  f"🖼️ Помилка! Перемикаюсь на {new_service}...")
+                                self.parent.current_image_service = new_service
+                                service = new_service
+                                error_attempts = 0
+                                break  # Вихід з Googler циклу
+                            else:
+                                if all_prompts_data:
+                                    first_item = all_prompts_data[0]
+                                    self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
+                                                                  f"🖼️ Помилка, повторна спроба через 10с...")
+                                time.sleep(10)
+            
+            # RECRAFT / POLLINATIONS - ПОСЛІДОВНА ГЕНЕРАЦІЯ
+            if service != 'Googler':
+                logging.info(f"Using {service} for sequential image generation")
+                
+                for idx, item in enumerate(all_prompts_data):
+                    self.check_killed()
+                    is_prompt_generated = False
+                    error_attempts = 0
+                    prompt = item['prompt']
+                    
+                    while not is_prompt_generated:
                         service = self.parent.current_image_service
-                        self.check_killed()
+                        
+                        if service == 'Googler':
+                            # Якщо перемкнулись на Googler, пропускаємо
+                            break
                         
                         try:
-                            self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service}: генерую {len(prompts)} зображень пачкою... (Спроба {error_attempts + 1})")
-                            logging.info(f"[{service}] Batch generating {len(prompts)} images for {scenario_name} (Attempt {error_attempts + 1})")
+                            status_prompt = (prompt[:60] + '...') if len(prompt) > 60 else prompt
+                            self.parent.status_update.emit(item['task_row'], item['lang_idx'], 
+                                                          f"🖼️ {service} [{idx+1}/{total_images}]: {status_prompt}")
+                            logging.info(f"[{service}] Generating [{idx+1}/{total_images}] for {item['scenario_name']}/img_{item['image_index']}.jpg")
+
+                            if service == 'Recraft':
+                                cfg = self.settings['api']['recraft']
+                                client = RecraftClient(cfg['api_key'])
+                                urls, errors = client.generate_images([prompt], style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
+                                if errors: raise RuntimeError("\n".join(errors))
+                                
+                                img_data = requests.get(urls[0]).content
+                                img_path = os.path.join(item['image_dir'], f"img_{item['image_index']}.png")
+                                with open(img_path, 'wb') as f: f.write(img_data)
+
+                            elif service == 'Pollinations':
+                                cfg = self.settings['api']['pollinations']
+                                client = PollinationsClient(api_key=cfg.get('token'))
+                                img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
+                                if error: raise RuntimeError(error)
+                                
+                                img_path = os.path.join(item['image_dir'], f"img_{item['image_index']}.jpg")
+                                with open(img_path, 'wb') as f: f.write(img_data)
                             
-                            cfg = self.settings['api']['googler']
-                            client = GooglerClient(cfg['api_key'])
-                            images = client.generate_images_batch(
-                                prompts, 
-                                aspect_ratio=cfg.get('aspect_ratio', 'IMAGE_ASPECT_RATIO_PORTRAIT'),
-                                seed=cfg.get('seed')
-                            )
+                            is_prompt_generated = True
+                            logging.info(f"Saved: {item['scenario_name']}/img_{item['image_index']}")
                             
-                            # Зберігаємо всі згенеровані зображення
-                            for i, img_data_uri in enumerate(images):
-                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service}: зберігаю зображення {i+1}/{len(images)}")
-                                # Витягуємо base64 дані з data URI
-                                header, encoded = img_data_uri.split(",", 1)
-                                img_data = base64.b64decode(encoded)
-                                with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f:
-                                    f.write(img_data)
-                            
-                            is_batch_generated = True
-                            
-                            # Оновлюємо статистику Googler після успішної пачкової генерації
-                            main_window = QApplication.instance().activeWindow()
-                            if main_window and hasattr(main_window, 'update_googler_usage_signal'):
-                                main_window.update_googler_usage_signal.emit()
-                                logging.info("Googler usage update requested after batch generation.")
-                            
-                            # Якщо використовували резервний сервіс, повертаємось до дефолтного
+                            # Якщо використовували резервний сервіс, повертаємося до дефолтного
                             if service != default_service:
-                                logging.info(f"Successfully generated batch with fallback service {service}. Returning to default service {default_service}.")
+                                logging.info(f"Returning to default service {default_service}.")
                                 self.parent.current_image_service = default_service
-                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Повертаюся до {default_service}")
                             
-                            time.sleep(5)
-                        
+                            time.sleep(2)
+
                         except Exception as e:
-                            logging.error(f"Batch image generation failed using {service} (Attempt {error_attempts + 1}): {e}")
+                            logging.error(f"Image generation failed [{idx+1}/{total_images}] using {service} (Attempt {error_attempts + 1}): {e}")
                             error_attempts += 1
                             
                             max_attempts = self.settings.get('image_service_retry_attempts', 5)
                             if error_attempts < max_attempts:
-                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 10с...")
+                                self.parent.status_update.emit(item['task_row'], item['lang_idx'], 
+                                                              f"🖼️ Помилка {service}, повторна спроба через 10с...")
                                 time.sleep(10)
                             else:
                                 if self.settings.get('auto_fallback_image_service', True):
-                                    # Для Googler перемикаємося на Recraft або Pollinations
-                                    new_service = 'Recraft' if default_service == 'Recraft' else 'Pollinations'
-                                    logging.warning(f"Failed after {max_attempts} attempts. Fallback enabled. Switching from {service} to {new_service}.")
-                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
+                                    new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
+                                    logging.warning(f"Switching from {service} to {new_service}.")
+                                    self.parent.status_update.emit(item['task_row'], item['lang_idx'], 
+                                                                  f"🖼️ Помилка! Перемикаюсь на {new_service}...")
                                     self.parent.current_image_service = new_service
                                     error_attempts = 0
-                                    break  # Виходимо з циклу Googler, щоб перейти до послідовної генерації
                                 else:
-                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 10с...")
+                                    self.parent.status_update.emit(item['task_row'], item['lang_idx'], 
+                                                                  f"🖼️ Помилка, повторна спроба через 10с...")
                                     time.sleep(10)
-                
-                # RECRAFT / POLLINATIONS - ПОСЛІДОВНА ГЕНЕРАЦІЯ (по одному)
-                if service != 'Googler' or not is_batch_generated:
-                    for i, prompt in enumerate(prompts):
-                        self.check_killed()
-                        is_prompt_generated = False
-                        error_attempts = 0
-                        
-                        while not is_prompt_generated:
-                            service = self.parent.current_image_service
-                            
-                            # Пропускаємо, якщо це Googler (ми вже обробили пачкою)
-                            if service == 'Googler':
-                                break
-                            
-                            try:
-                                status_prompt = (prompt[:75] + '...') if len(prompt) > 75 else prompt
-                                self.parent.status_update.emit(task_row, lang_idx, f"🖼️ {service} [{i+1}/{len(prompts)}]: {status_prompt} (Спроба {error_attempts + 1})")
-                                logging.info(f"[{service}] Generating image {i+1}/{len(prompts)} (Attempt {error_attempts + 1}) for {scenario_name} with prompt: {prompt}")
-
-                                if service == 'Recraft':
-                                    cfg = self.settings['api']['recraft']
-                                    client = RecraftClient(cfg['api_key'])
-                                    urls, errors = client.generate_images([prompt], style=cfg['style'], model=cfg['model'], size=cfg['size'], negative_prompt=cfg.get('negative_prompt'))
-                                    if errors: raise RuntimeError("\n".join(errors))
-                                    
-                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Recraft: завантажую картинку {i+1}/{len(prompts)}")
-                                    img_data = requests.get(urls[0]).content
-                                    with open(os.path.join(image_dir, f'img_{i+1}.png'), 'wb') as f: f.write(img_data)
-
-                                elif service == 'Pollinations':
-                                    cfg = self.settings['api']['pollinations']
-                                    client = PollinationsClient(api_key=cfg.get('token'))
-                                    img_data, error = client.generate_image(prompt, width=cfg.get('width', 1024), height=cfg.get('height', 1024), model=cfg.get('model', 'flux'), nologo=cfg.get('nologo', False))
-                                    if error: raise RuntimeError(error)
-                                    
-                                    with open(os.path.join(image_dir, f'img_{i+1}.jpg'), 'wb') as f: f.write(img_data)
-                                
-                                is_prompt_generated = True
-                                
-                                # Якщо ми використовували резервний сервіс і успішно згенерували зображення,
-                                # повертаємося до дефолтного сервісу для наступних зображень
-                                if service != default_service:
-                                    logging.info(f"Successfully generated image with fallback service {service}. Returning to default service {default_service}.")
-                                    self.parent.current_image_service = default_service
-                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Повертаюся до {default_service}")
-                                
-                                time.sleep(5)
-
-                            except Exception as e:
-                                logging.error(f"Image generation failed for prompt {i+1} using {service} (Attempt {error_attempts + 1}): {e}")
-                                error_attempts += 1
-                                
-                                max_attempts = self.settings.get('image_service_retry_attempts', 5)
-                                if error_attempts < max_attempts:
-                                    self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка {service}, повторна спроба через 10с...")
-                                    time.sleep(10)
-                                else:
-                                    if self.settings.get('auto_fallback_image_service', True):
-                                        new_service = 'Pollinations' if service == 'Recraft' else 'Recraft'
-                                        logging.warning(f"Failed after {max_attempts} attempts. Fallback enabled. Switching from {service} to {new_service}.")
-                                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка! Перемикаюсь на {new_service}...")
-                                        self.parent.current_image_service = new_service
-                                        error_attempts = 0
-                                    else:
-                                        self.parent.status_update.emit(task_row, lang_idx, f"🖼️ Помилка, повторна спроба через 10с...")
-                                        time.sleep(10)
 
             self.signals.finished.emit(True, "images")
             
@@ -1073,19 +1385,10 @@ class MainTaskWorker(QObject):
             logging.info(f"--- Finished audio generation for language: {lang_id} ---")
 
     def _run_sequential_transcription(self):
-        """Послідовно транскрибує всі готові аудіофайли."""
-        logging.info("--- Sub-step: Sequential Transcription from AUDIO files ---")
+        """Послідовно транскрибує всі готові аудіофайли за допомогою AMD Whisper CLI."""
+        logging.info("--- Sub-step: Sequential Transcription from AUDIO files (AMD Whisper CLI) ---")
         
-        model = whisper.load_model("base")
         sub_settings = self.settings.get('ffmpeg', {}).get('subtitle', {})
-        max_words = sub_settings.get('max_words_per_segment', 8)
-
-        # Словник для перетворення вирівнювання з налаштувань у формат pysubs2
-        alignment_map_pysubs2 = {
-            '1': 1, '2': 2, '3': 3,       # Bottom
-            '4': 5, '5': 6, '6': 7,       # Middle (pysubs2 uses different numbers)
-            '7': 9, '8': 10, '9': 11      # Top
-        }
 
         for task_row, lang_idx, lang_config, settings, path in self.scenario_paths:
             self.check_killed()
@@ -1098,68 +1401,46 @@ class MainTaskWorker(QObject):
                 logging.warning(f"Audio file not found for {scenario_name}, skipping transcription.")
                 continue
 
-            # --- НОВИЙ РЯДОК ЛОГУВАННЯ ---
-            self.status_update.emit(task_row, lang_idx, f"✒️ Транскрипція для {scenario_name}...")
-            logging.info(f"Starting transcription for {scenario_name}...")
+            self.status_update.emit(task_row, lang_idx, f"✒️ Транскрипція (AMD) для {scenario_name}...")
+            logging.info(f"Starting AMD Whisper transcription for {scenario_name}...")
             
             try:
-                result = model.transcribe(audio_path, verbose=False, word_timestamps=True)
+                # Визначаємо мову з lang_config
+                # voice_code має формат 'uk-UA', 'pl-PL', тощо
+                voice_code = lang_config.get('voice_code', 'en')
+                # Беремо перші 2 символи для коду мови (uk, pl, en, etc.)
+                language = voice_code.split('-')[0].lower() if voice_code else 'en'
                 
-                subs = pysubs2.SSAFile()
+                logging.info(f"Transcription language: {language} (from voice_code: {voice_code})")
                 
-                def _ass_to_pysubs2_color(ass_color):
-                    try:
-                        if not ass_color.startswith('&H'): return pysubs2.Color(255, 255, 255)
-                        hex_color = ass_color.lstrip('&H').rstrip('&')
-                        if len(hex_color) == 8:
-                            aa, bb, gg, rr = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16), int(hex_color[6:8], 16)
-                            return pysubs2.Color(r=rr, g=gg, b=bb, a=aa)
-                        else:
-                            bb, gg, rr = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-                            return pysubs2.Color(r=rr, g=gg, b=bb)
-                    except Exception: return pysubs2.Color(255, 255, 255)
-
-                style = subs.styles["Default"].copy()
-                style.fontname = sub_settings.get('fontname', 'Arial')
-                style.fontsize = float(sub_settings.get('fontsize', 60))
-                style.primarycolor = _ass_to_pysubs2_color(sub_settings.get('primary_color', '&H00FFFFFF'))
-                style.secondarycolor = _ass_to_pysubs2_color(sub_settings.get('secondary_color', '&H000000FF'))
-                style.outlinecolor = _ass_to_pysubs2_color(sub_settings.get('outline_color', '&H00000000'))
-                style.backcolor = _ass_to_pysubs2_color(sub_settings.get('shadow_color', '&H96000000'))
-                style.bold = sub_settings.get('bold', True)
-                style.italic = sub_settings.get('italic', False)
-                style.outline = float(sub_settings.get('outline', 3.0))
-                style.shadow = float(sub_settings.get('shadow', 3.0))
+                # 1. Викликаємо CLI Whisper для створення SRT
+                srt_path = run_whisper_cli_amd(
+                    audio_path=audio_path,
+                    language=language,
+                    model='base',  # Можна зробити налаштовуваним
+                    threads=4,     # Можна зробити налаштовуваним
+                    use_gpu=True   # Можна зробити налаштовуваним
+                )
                 
-                alignment_key = sub_settings.get('alignment', '2')
-                style.alignment = alignment_map_pysubs2.get(alignment_key, 2)
-
-                style.marginl = int(sub_settings.get('marginl', 20))
-                style.marginr = int(sub_settings.get('marginr', 20))
-                style.marginv = int(sub_settings.get('marginv', 60))
+                if not srt_path:
+                    raise RuntimeError("AMD Whisper failed to create SRT file")
                 
-                subs.styles["Default"] = style
-
-                all_words = [word for s in result['segments'] if 'words' in s for word in s['words']]
-
-                animation = sub_settings.get('animation', 'None')
-                anim_tag = ""
-                if animation == "Fade": anim_tag = "{\\fad(250,250)}"
-                elif animation == "Karaoke": anim_tag = "{\\fad(150,150)}"
-
-                current_pos = 0
-                while current_pos < len(all_words):
-                    segment_words = all_words[current_pos : current_pos + max_words]
-                    if not segment_words: break
-                    start_time = segment_words[0]['start'] * 1000
-                    end_time = segment_words[-1]['end'] * 1000
-                    text = " ".join(word['word'] for word in segment_words).strip()
-                    full_text = f"{anim_tag}{text}"
-                    event = pysubs2.SSAEvent(start=start_time, end=end_time, text=full_text)
-                    subs.events.append(event)
-                    current_pos += max_words
+                # 2. Конвертуємо SRT в ASS зі збереженням стилів
+                success = convert_srt_to_ass_with_settings(srt_path, ass_path, sub_settings)
                 
-                subs.save(ass_path)
+                # 3. Видаляємо тимчасовий SRT файл
+                try:
+                    if os.path.exists(srt_path):
+                        os.remove(srt_path)
+                        logging.info(f"Видалено тимчасовий SRT: {srt_path}")
+                except Exception as e:
+                    logging.warning(f"Не вдалося видалити тимчасовий SRT: {e}")
+                
+                if not success:
+                    raise RuntimeError("Failed to convert SRT to ASS")
+                
+                logging.info(f"Transcription completed for {scenario_name}")
+                
             except Exception as e:
                 logging.error(f"Failed to create subtitles for {scenario_name}: {e}", exc_info=True)
                 raise e
@@ -2820,58 +3101,52 @@ class SettingsTab(QWidget):
             process1 = subprocess.run(cmd1, capture_output=True, text=True, encoding='utf-8')
             if process1.returncode != 0: raise RuntimeError(f"FFmpeg Stage 1 failed:\n{process1.stderr}")
 
-            self.preview_btn.setText("Етап 2: Транскрипція..."); QApplication.processEvents()
-            model = whisper.load_model("base")
-            result = model.transcribe(temp_video_path, verbose=False, word_timestamps=True)
+            self.preview_btn.setText("Етап 2: Транскрипція (AMD)..."); QApplication.processEvents()
             
-            subs = pysubs2.SSAFile()
-            style = subs.styles["Default"].copy()
+            # Створюємо словник налаштувань субтитрів з UI
+            preview_sub_settings = {
+                'fontname': self.sub_fontname_combo.currentText(),
+                'fontsize': self.sub_fontsize.value(),
+                'primary_color': self.sub_primary_color.text(),
+                'secondary_color': self.sub_secondary_color.text(),
+                'outline_color': self.sub_outline_color.text(),
+                'shadow_color': self.sub_shadow_color.text(),
+                'bold': self.sub_bold.isChecked(),
+                'italic': self.sub_italic.isChecked(),
+                'outline': self.sub_outline.value(),
+                'shadow': self.sub_shadow.value(),
+                'alignment': self.sub_alignment.currentData(),
+                'marginl': self.sub_marginl.value(),
+                'marginr': self.sub_marginr.value(),
+                'marginv': self.sub_marginv.value(),
+                'max_words_per_segment': self.sub_max_words.value(),
+                'animation': self.sub_animation.currentText()
+            }
             
-            # Використовуємо значення прямо з віджетів UI
-            style.fontname = self.sub_fontname_combo.currentText()
-            style.fontsize = float(self.sub_fontsize.value())
-
-            def _ass_to_pysubs2_color(ass_color):
-                try:
-                    if not ass_color.startswith('&H'): return pysubs2.Color(255, 255, 255)
-                    hex_color = ass_color.lstrip('&H').rstrip('&')
-                    if len(hex_color) == 8: aa, bb, gg, rr = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16), int(hex_color[6:8], 16); return pysubs2.Color(r=rr, g=gg, b=bb, a=aa)
-                    else: bb, gg, rr = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16); return pysubs2.Color(r=rr, g=gg, b=bb)
-                except Exception: return pysubs2.Color(255, 255, 255)
+            # Викликаємо CLI Whisper для створення SRT
+            srt_path = run_whisper_cli_amd(
+                audio_path=temp_video_path,  # CLI може працювати з відео файлами
+                language='en',  # Можна зробити налаштовуваним
+                model='base',
+                threads=4,
+                use_gpu=True
+            )
             
-            style.primarycolor = _ass_to_pysubs2_color(self.sub_primary_color.text())
-            style.secondarycolor = _ass_to_pysubs2_color(self.sub_secondary_color.text())
-            style.outlinecolor = _ass_to_pysubs2_color(self.sub_outline_color.text())
-            style.backcolor = _ass_to_pysubs2_color(self.sub_shadow_color.text())
-            style.bold = self.sub_bold.isChecked()
-            style.italic = self.sub_italic.isChecked()
-            style.outline = self.sub_outline.value()
-            style.shadow = self.sub_shadow.value()
-
-            alignment_map_pysubs2 = {'1': 1, '2': 2, '3': 3, '4': 5, '5': 6, '6': 7, '7': 9, '8': 10, '9': 11}
-            style.alignment = alignment_map_pysubs2.get(self.sub_alignment.currentData(), 2)
-
-            style.marginl = self.sub_marginl.value()
-            style.marginr = self.sub_marginr.value()
-            style.marginv = self.sub_marginv.value()
-            subs.styles["Default"] = style
-
-            all_words = [word for s in result['segments'] if 'words' in s for word in s['words']]
-            animation, max_words = self.sub_animation.currentText(), self.sub_max_words.value()
-            anim_tag = ""
-            if animation == "Fade": anim_tag = "{\\fad(250,250)}"
-            elif animation == "Karaoke": anim_tag = "{\\fad(150,150)}"
+            if not srt_path:
+                raise RuntimeError("AMD Whisper failed to create SRT file for preview")
             
-            current_pos = 0
-            while current_pos < len(all_words):
-                segment_words = all_words[current_pos : current_pos + max_words]
-                if not segment_words: break
-                start_time, end_time = segment_words[0]['start'] * 1000, segment_words[-1]['end'] * 1000
-                text = " ".join(word['word'] for word in segment_words).strip()
-                event = pysubs2.SSAEvent(start=start_time, end=end_time, text=f"{anim_tag}{text}")
-                subs.events.append(event)
-                current_pos += max_words
-            subs.save(ass_path)
+            # Конвертуємо SRT в ASS зі стилями
+            success = convert_srt_to_ass_with_settings(srt_path, ass_path, preview_sub_settings)
+            
+            # Видаляємо тимчасовий SRT
+            try:
+                if os.path.exists(srt_path):
+                    os.remove(srt_path)
+            except Exception as e:
+                logging.warning(f"Не вдалося видалити тимчасовий SRT: {e}")
+            
+            if not success:
+                raise RuntimeError("Failed to convert SRT to ASS for preview")
             
             self.preview_btn.setText("Етап 3: Фіналізація..."); QApplication.processEvents()
             safe_ass_path = os.path.abspath(ass_path).replace('\\', '/').replace(':', '\\:')
