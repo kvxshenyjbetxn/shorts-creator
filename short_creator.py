@@ -832,8 +832,7 @@ class GooglerClient(ApiClient):
                 img_usage = current_usage.get("image_generation", {})
                 used = img_usage.get("current_usage", 0)
                 limit = data.get("account_limits", {}).get("img_gen_per_hour_limit", 0)
-                remaining = limit - used
-                return f"{remaining}/{limit}"
+                return f"{used}/{limit}"
             return "Error"
         except Exception:
             return "Error"
@@ -981,95 +980,139 @@ class ImageGenerationWorker(BaseWorker):
             default_service = self.settings.get('default_image_service', 'Recraft')
             service = self.parent.current_image_service
             
-            # GOOGLER - ПАЧКОВА ГЕНЕРАЦІЯ (всі зображення одразу для ВСІХ сценаріїв)
+            # GOOGLER - ПАРАЛЕЛЬНА ГЕНЕРАЦІЯ (кожна картинка окремо, 15 потоків)
             if service == 'Googler':
-                error_attempts = 0
-                is_generated = False
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 
-                while not is_generated:
-                    service = self.parent.current_image_service
+                cfg = self.settings['api']['googler']
+                max_attempts = self.settings.get('image_service_retry_attempts', 5)
+                max_threads = 15
+                
+                logging.info(f"=== Googler: генерація {total_images} зображень (до {max_threads} паралельно) ===")
+                
+                def generate_single_image(item_data):
+                    """Генерує одну картинку (1 спроба)."""
+                    item = item_data
+                    prompt = item['prompt']
+                    img_path = os.path.join(item['image_dir'], f"img_{item['image_index']}.jpg")
+                    
+                    # Якщо вже є - пропускаємо
+                    if os.path.exists(img_path):
+                        logging.debug(f"Картинка вже існує: {item['scenario_name']}/img_{item['image_index']}.jpg")
+                        return (True, item, None)
+                    
                     self.check_killed()
                     
+                    # Перевіряємо чи не перемкнулись на інший сервіс
+                    if self.parent.current_image_service != 'Googler':
+                        return (False, item, "Switched to another service")
+                    
                     try:
-                        # Оновлюємо статус
-                        if all_prompts_data:
-                            first_item = all_prompts_data[0]
-                            self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
-                                                          f"🖼️ {service}: генерую {total_images} зображень (15 потоків)... (Спроба {error_attempts + 1})")
-                        logging.info(f"[{service}] Batch generating {total_images} images for ALL scenarios (Attempt {error_attempts + 1})")
+                        # API запит для однієї картинки
+                        payload = {
+                            "provider": "google_fx",
+                            "operation": "generate",
+                            "parameters": {
+                                "prompt": prompt,
+                                "aspect_ratio": cfg.get('aspect_ratio', 'IMAGE_ASPECT_RATIO_PORTRAIT')
+                            }
+                        }
+                        if cfg.get('seed'):
+                            payload["parameters"]["seed"] = cfg.get('seed')
                         
-                        cfg = self.settings['api']['googler']
-                        client = GooglerClient(cfg['api_key'])
-                        
-                        # Витягуємо тільки промпти для API
-                        all_prompts = [item['prompt'] for item in all_prompts_data]
-                        
-                        # Генеруємо ВСІ зображення одночасно (15 потоків)
-                        images = client.generate_images_batch(
-                            all_prompts, 
-                            aspect_ratio=cfg.get('aspect_ratio', 'IMAGE_ASPECT_RATIO_PORTRAIT'),
-                            seed=cfg.get('seed')
+                        response = requests.post(
+                            f"https://app.recrafter.fun/api/v1/images",
+                            headers={"X-API-Key": cfg['api_key'], "Content-Type": "application/json"},
+                            json=payload,
+                            timeout=300
                         )
+                        response.raise_for_status()
+                        result = response.json()
                         
-                        # Зберігаємо кожне зображення у відповідну папку
-                        for i, (item, img_data_uri) in enumerate(zip(all_prompts_data, images)):
-                            self.parent.status_update.emit(item['task_row'], item['lang_idx'], 
-                                                          f"🖼️ Зберігаю {i+1}/{total_images}: {item['scenario_name']}/img_{item['image_index']}.jpg")
-                            
-                            # Витягуємо base64 дані з data URI
+                        if result.get("success"):
+                            img_data_uri = result.get("result")
                             header, encoded = img_data_uri.split(",", 1)
                             img_data = base64.b64decode(encoded)
                             
-                            # Зберігаємо у відповідну папку з відповідним індексом
-                            img_path = os.path.join(item['image_dir'], f"img_{item['image_index']}.jpg")
                             with open(img_path, 'wb') as f:
                                 f.write(img_data)
                             
-                            logging.info(f"Saved: {item['scenario_name']}/img_{item['image_index']}.jpg")
-                        
-                        is_generated = True
-                        logging.info(f"✓ Успішно згенеровано і збережено {total_images} зображень для всіх сценаріїв")
-                        
-                        # Оновлюємо статистику Googler
-                        main_window = QApplication.instance().activeWindow()
-                        if main_window and hasattr(main_window, 'update_googler_usage_signal'):
-                            main_window.update_googler_usage_signal.emit()
-                            logging.info("Googler usage update requested after batch generation.")
-                        
-                        # Якщо використовували резервний сервіс, повертаємось до дефолтного
-                        if service != default_service:
-                            logging.info(f"Successfully generated batch. Returning to default service {default_service}.")
-                            self.parent.current_image_service = default_service
+                            logging.info(f"✓ Saved: {item['scenario_name']}/img_{item['image_index']}.jpg")
+                            time.sleep(0.5)  # Невелика затримка
+                            return (True, item, None)
+                        else:
+                            error_msg = result.get("error", "Unknown error")
+                            raise RuntimeError(f"API error: {error_msg}")
                     
                     except Exception as e:
-                        logging.error(f"Batch image generation failed using {service} (Attempt {error_attempts + 1}): {e}")
-                        error_attempts += 1
+                        logging.error(f"Помилка {item['scenario_name']}/img_{item['image_index']}: {e}")
+                        return (False, item, str(e))
+                
+                # Генеруємо картинки раундами (до 5 раундів)
+                items_to_generate = all_prompts_data
+                saved_count = 0
+                
+                for round_num in range(max_attempts):
+                    if not items_to_generate:
+                        break  # Всі згенеровані
+                    
+                    logging.info(f"=== Googler раунд {round_num + 1}/{max_attempts}: {len(items_to_generate)} картинок ===")
+                    
+                    failed_items = []
+                    round_saved = 0
+                    
+                    # Генеруємо поточний список паралельно
+                    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                        future_to_item = {
+                            executor.submit(generate_single_image, item): item 
+                            for item in items_to_generate
+                        }
                         
-                        max_attempts = self.settings.get('image_service_retry_attempts', 5)
-                        if error_attempts < max_attempts:
-                            if all_prompts_data:
-                                first_item = all_prompts_data[0]
-                                self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
-                                                              f"🖼️ Помилка {service}, повторна спроба через 10с...")
-                            time.sleep(10)
-                        else:
-                            if self.settings.get('auto_fallback_image_service', True):
-                                new_service = 'Recraft' if default_service == 'Recraft' else 'Pollinations'
-                                logging.warning(f"Failed after {max_attempts} attempts. Switching to {new_service}.")
-                                if all_prompts_data:
-                                    first_item = all_prompts_data[0]
-                                    self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
-                                                                  f"🖼️ Помилка! Перемикаюсь на {new_service}...")
-                                self.parent.current_image_service = new_service
-                                service = new_service
-                                error_attempts = 0
-                                break  # Вихід з Googler циклу
-                            else:
-                                if all_prompts_data:
-                                    first_item = all_prompts_data[0]
-                                    self.parent.status_update.emit(first_item['task_row'], first_item['lang_idx'], 
-                                                                  f"🖼️ Помилка, повторна спроба через 10с...")
-                                time.sleep(10)
+                        for future in as_completed(future_to_item):
+                            item = future_to_item[future]
+                            try:
+                                success, result_item, error = future.result()
+                                if success:
+                                    saved_count += 1
+                                    round_saved += 1
+                                    self.parent.status_update.emit(result_item['task_row'], result_item['lang_idx'], 
+                                        f"🖼️ Googler р{round_num+1}: {saved_count}/{total_images}")
+                                else:
+                                    failed_items.append(result_item)
+                            except Exception as e:
+                                logging.error(f"Future exception: {e}")
+                                failed_items.append(item)
+                    
+                    logging.info(f"Раунд {round_num + 1}: успішно {round_saved}, невдало {len(failed_items)}")
+                    
+                    # Якщо все згенеровано - виходимо
+                    if not failed_items:
+                        break
+                    
+                    # Для наступного раунду беремо тільки failed
+                    items_to_generate = failed_items
+                    
+                    # Пауза між раундами (окрім останнього)
+                    if failed_items and round_num < max_attempts - 1:
+                        logging.info(f"Пауза 10 секунд перед раундом {round_num + 2}...")
+                        time.sleep(10)
+                
+                logging.info(f"✓ Googler: Успішно {saved_count}/{total_images} зображень")
+                
+                # Оновлюємо статистику
+                if saved_count > 0:
+                    main_window = QApplication.instance().activeWindow()
+                    if main_window and hasattr(main_window, 'update_googler_usage_signal'):
+                        main_window.update_googler_usage_signal.emit()
+                
+                # Якщо після 5 раундів є failed і включений fallback - перемикаємось
+                if items_to_generate and self.settings.get('auto_fallback_image_service', True):
+                    new_service = 'Recraft' if default_service == 'Recraft' else 'Pollinations'
+                    logging.warning(f"Після {max_attempts} раундів {len(items_to_generate)} картинок не вдалося згенерувати. Перемикаюсь на {new_service}.")
+                    self.parent.current_image_service = new_service
+                    service = new_service
+                    # Оновлюємо all_prompts_data - залишаємо тільки failed
+                    all_prompts_data = items_to_generate
             
             # RECRAFT / POLLINATIONS - ПОСЛІДОВНА ГЕНЕРАЦІЯ
             if service != 'Googler':
@@ -1446,12 +1489,10 @@ class MainTaskWorker(QObject):
                 raise e
 
     def run_video_assembly_pipeline(self):
-        """Запускає монтаж тимчасових відео, а потім фіналізацію."""
+        """Запускає створення фінальних відео (монтаж + субтитри) в один етап."""
         try:
             self.check_killed()
-            self._run_parallel_stage(SilentMontageWorker, "--- Step: Creating silent videos ---")
-            self.check_killed()
-            self._run_parallel_stage(FinalizeVideoWorker, "--- Step: Finalizing videos ---")
+            self._run_parallel_stage(SilentMontageWorker, "--- Step: Creating final videos ---")
             
             logging.info(f"Task #{self.task_id} finished successfully.")
             self.finished.emit(True, self.task_id)
@@ -1577,7 +1618,7 @@ class AudioGenerationWorker(BaseWorker):
             self.signals.finished.emit(success, None)
 
 class SilentMontageWorker(BaseWorker):
-    """Створює тимчасове 'німе' відео з картинок, переходів та аудіодоріжки."""
+    """Створює фінальне відео з картинок, переходів, аудіо та субтитрів."""
     def __init__(self, task_row, lang_idx, lang_config, settings, scenario_path):
         super().__init__(settings=settings)
         self.task_row, self.lang_idx, self.lang_config, self.settings, self.scenario_path = task_row, lang_idx, lang_config, settings, scenario_path
@@ -1587,8 +1628,8 @@ class SilentMontageWorker(BaseWorker):
         success = False
         scenario_name = os.path.basename(self.scenario_path)
         try:
-            self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎞️ Монтаж для {scenario_name}...")
-            logging.info(f"Starting silent montage for {scenario_name}...")
+            self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎬 Створення відео {scenario_name}...")
+            logging.info(f"Starting video creation for {scenario_name}...")
 
             audio_path, img_dir = os.path.join(self.scenario_path, 'audio.mp3'), os.path.join(self.scenario_path, 'images')
             if not all(os.path.exists(p) for p in [audio_path, img_dir]): raise FileNotFoundError("Assets not ready.")
@@ -1610,7 +1651,9 @@ class SilentMontageWorker(BaseWorker):
                 except Exception as e:
                     logging.warning(f"Could not read title from {title_path}, using default name. Error: {e}")
             
-            temp_video_path = os.path.join(output_dir, f"temp_{video_filename}")
+            final_video_path = os.path.join(output_dir, video_filename)  # Одразу фінальний файл
+            ass_path = os.path.join(self.scenario_path, 'subtitles.ass')
+            has_subtitles = os.path.exists(ass_path)
             # --- Кінець нової логіки ---
 
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
@@ -1657,7 +1700,16 @@ class SilentMontageWorker(BaseWorker):
                     f_complex.append(f"{last_stream}[v{i+1}]xfade=transition=fade:duration={transition_duration}:offset={offset}[vt{i}]")
                     last_stream = f"[vt{i}]"
             
-            f_complex.append(f"{last_stream}format=yuv420p[outv]")
+            # Додаємо ASS субтитри якщо вони є
+            if has_subtitles:
+                safe_ass = ass_path.replace('\\', '/').replace(':', '\\:')
+                font_dir = 'C:/Windows/Fonts'.replace(':', '\\:')
+                f_complex.append(f"{last_stream}format=yuv420p,ass=filename='{safe_ass}':fontsdir='{font_dir}'[outv]")
+                logging.info(f"Adding subtitles from {ass_path}")
+            else:
+                f_complex.append(f"{last_stream}format=yuv420p[outv]")
+                logging.warning(f"No subtitles found at {ass_path}, creating video without subtitles")
+            
             cmd.extend(['-filter_complex', ";".join(f_complex), '-map', '[outv]', '-map', f'{len(images)}:a'])
             
             codec_key, codec_cfg = cfg.get('selected_codec', 'CPU (libx264)'), cfg.get('codecs', {})
@@ -1665,68 +1717,16 @@ class SilentMontageWorker(BaseWorker):
             cmd.extend(['-c:v', codec_config.get('codec', 'libx264')])
             if 'bitrate' in codec_config: cmd.extend(['-b:v', codec_config['bitrate']])
             elif 'preset' in codec_config and 'crf' in codec_config: cmd.extend(['-preset', codec_config['preset'], '-crf', str(codec_config['crf'])])
-            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-shortest', temp_video_path])
+            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-shortest', final_video_path])
             
             proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
-            if proc.returncode != 0: raise RuntimeError(f"FFmpeg failed during montage:\n{proc.stderr}")
+            if proc.returncode != 0: raise RuntimeError(f"FFmpeg failed during video creation:\n{proc.stderr}")
+            
+            logging.info(f"Successfully created final video: {final_video_path}")
             success = True
         except Exception as e:
             logging.error(f"SilentMontageWorker error for {scenario_name}: {e}", exc_info=True)
         finally:
-            self.signals.finished.emit(success, None)
-
-class FinalizeVideoWorker(BaseWorker):
-    """Впаює субтитри у тимчасове відео для отримання фінального результату."""
-    def __init__(self, task_row, lang_idx, lang_config, settings, scenario_path):
-        super().__init__(settings=settings)
-        self.task_row, self.lang_idx, self.lang_config, self.settings, self.scenario_path = task_row, lang_idx, lang_config, settings, scenario_path
-
-    @Slot()
-    def run(self):
-        success = False
-        s_name = os.path.basename(self.scenario_path); out_dir = os.path.dirname(self.scenario_path)
-        
-        # --- Нова логіка для визначення назви файлу (ідентична до SilentMontageWorker) ---
-        title_path = os.path.join(self.scenario_path, 'title.txt')
-        v_filename = f"video_{s_name.split('_')[-1]}.mp4" # Назва за замовчуванням
-        if os.path.exists(title_path):
-            try:
-                with open(title_path, 'r', encoding='utf-8') as f:
-                    title = f.read().strip()
-                if title:
-                    sanitized_title = re.sub(r'[\\/*?:"<>|]', "", title)
-                    v_filename = f"{sanitized_title}.mp4"
-            except Exception as e:
-                logging.warning(f"Could not read title from {title_path}, using default name. Error: {e}")
-
-        final_path, temp_path, ass_path = os.path.join(out_dir, v_filename), os.path.join(out_dir, f"temp_{v_filename}"), os.path.join(self.scenario_path, 'subtitles.ass')
-        # --- Кінець нової логіки ---
-        
-        try:
-            self.signals.status_update.emit(self.task_row, self.lang_idx, f"🎬 Finalizing {s_name}")
-            if not all(os.path.exists(p) for p in [temp_path, ass_path]): raise FileNotFoundError(f"Missing assets for {s_name}")
-
-            safe_ass = ass_path.replace('\\', '/').replace(':', '\\:')
-            font_dir = 'C:/Windows/Fonts'.replace(':', '\\:')
-            vf_str = f"ass=filename='{safe_ass}':fontsdir='{font_dir}'"
-            cmd = ['ffmpeg', '-y', '-i', temp_path, '-vf', vf_str]
-            
-            cfg = self.settings['ffmpeg']
-            codec_key = cfg.get('selected_codec', 'CPU (libx264)'); codec_config = cfg.get('codecs', {}).get(codec_key, {})
-            cmd.extend(['-c:v', codec_config.get('codec', 'libx264')])
-            if 'bitrate' in codec_config: cmd.extend(['-b:v', codec_config['bitrate']])
-            elif 'preset' in codec_config and 'crf' in codec_config: cmd.extend(['-preset', codec_config['preset'], '-crf', str(codec_config['crf'])])
-            cmd.extend(['-c:a', 'copy', final_path])
-
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
-            if proc.returncode != 0: raise RuntimeError(f"FFmpeg failed during finalization:\n{proc.stderr}")
-            success = True
-        except Exception as e:
-            logging.error(f"FinalizeVideoWorker error for {s_name}: {e}", exc_info=True)
-        finally:
-            if os.path.exists(temp_path):
-                try: os.remove(temp_path)
-                except OSError as e: logging.error(f"Failed to remove temp file {temp_path}: {e}")
             self.signals.finished.emit(success, None)
 
 class PreviewWorker(BaseWorker):
@@ -2323,8 +2323,7 @@ class TaskCreationTab(QWidget):
                     elif "🖼️" in status or "зображення" in s_lower: progress_value = 30
                     elif "🎤" in status or "audio" in s_lower: progress_value = 50
                     elif "✒️" in status or "subtitles" in s_lower: progress_value = 65
-                    elif "🎞️" in status or "montage" in s_lower: progress_value = 80
-                    elif "🎬" in status or "finalizing" in s_lower: progress_value = 95
+                    elif "🎬" in status or "montage" in s_lower or "відео" in s_lower: progress_value = 95
                     elif "✅" in status or "completed" in s_lower: progress_value = 100
                     elif "❌" in status or "failed" in s_lower: progress_value = 100
                     
@@ -2389,8 +2388,7 @@ class TaskCreationTab(QWidget):
                     elif "🖼️" in status or "зображення" in s_lower: progress_value = 30
                     elif "🎤" in status or "audio" in s_lower: progress_value = 50
                     elif "✒️" in status or "subtitles" in s_lower: progress_value = 65
-                    elif "🎞️" in status or "montage" in s_lower: progress_value = 80
-                    elif "🎬" in status or "finalizing" in s_lower: progress_value = 95
+                    elif "🎬" in status or "montage" in s_lower or "відео" in s_lower: progress_value = 95
                     elif "✅" in status or "completed" in s_lower: progress_value = 100
                     elif "❌" in status or "failed" in s_lower: progress_value = 100
                     
